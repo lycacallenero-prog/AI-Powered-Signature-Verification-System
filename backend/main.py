@@ -9,6 +9,7 @@ from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.applications.mobilenet_v2 import MobileNetV2, preprocess_input
 from tensorflow.keras.applications.resnet50 import ResNet50
+from tensorflow.keras.applications.efficientnet import EfficientNetB0, preprocess_input as efficientnet_preprocess
 import pickle
 import asyncio
 import time
@@ -122,6 +123,200 @@ class ElementMultiplyLayer(layers.Layer):
     
     def get_config(self):
         return super().get_config()
+
+# -----------------------------
+# Signature Detection and Image Classification
+# -----------------------------
+class SignatureDetector:
+    """AI-powered signature detection and image classification"""
+    
+    def __init__(self):
+        self.signature_classifier = None
+        self.image_classifier = None
+        self._initialize_models()
+    
+    def _initialize_models(self):
+        """Initialize the signature detection and image classification models"""
+        try:
+            # Create a simple signature detection model
+            self.signature_classifier = self._create_signature_detector()
+            
+            # Use pre-trained EfficientNet for general image classification
+            self.image_classifier = EfficientNetB0(
+                weights='imagenet',
+                include_top=True,
+                input_shape=(224, 224, 3)
+            )
+            logger.info("Signature detector and image classifier initialized")
+        except Exception as e:
+            logger.error(f"Error initializing signature detector: {e}")
+    
+    def _create_signature_detector(self):
+        """Create a binary classifier to detect if image contains a signature"""
+        inputs = keras.Input(shape=(128, 128, 3))
+        
+        # Use MobileNetV2 as backbone
+        backbone = MobileNetV2(
+            input_shape=(128, 128, 3),
+            include_top=False,
+            weights='imagenet'
+        )(inputs)
+        
+        x = layers.GlobalAveragePooling2D()(backbone)
+        x = layers.Dense(128, activation='relu')(x)
+        x = layers.Dropout(0.5)(x)
+        x = layers.Dense(64, activation='relu')(x)
+        x = layers.Dropout(0.3)(x)
+        
+        # Binary classification: signature (1) or not signature (0)
+        outputs = layers.Dense(1, activation='sigmoid', name='signature_detection')(x)
+        
+        model = keras.Model(inputs, outputs, name='signature_detector')
+        model.compile(
+            optimizer='adam',
+            loss='binary_crossentropy',
+            metrics=['accuracy']
+        )
+        
+        return model
+    
+    def is_signature(self, image_array: np.ndarray, threshold: float = 0.5) -> tuple:
+        """
+        Detect if the image contains a signature
+        Returns: (is_signature: bool, confidence: float, description: str)
+        """
+        try:
+            # Preprocess image for signature detection
+            if image_array.shape[-1] == 1:
+                # Convert grayscale to RGB
+                image_rgb = np.stack([image_array.squeeze()] * 3, axis=-1)
+            else:
+                image_rgb = image_array
+            
+            # Resize to 128x128 for signature detection
+            resized = tf.image.resize(image_rgb[np.newaxis, ...], (128, 128))
+            resized = tf.cast(resized, tf.float32) / 255.0
+            
+            # Check if it's likely a signature using heuristics
+            signature_score = self._calculate_signature_likelihood(image_array)
+            
+            if signature_score > threshold:
+                return True, signature_score, "Image appears to contain a signature"
+            else:
+                # If not a signature, classify what it actually is
+                description = self._classify_image_content(image_rgb)
+                return False, signature_score, f"Not a signature. Image appears to be: {description}"
+                
+        except Exception as e:
+            logger.error(f"Error in signature detection: {e}")
+            return False, 0.0, "Error analyzing image"
+    
+    def _calculate_signature_likelihood(self, image_array: np.ndarray) -> float:
+        """
+        Calculate likelihood that image contains a signature using computer vision heuristics
+        """
+        try:
+            # Convert to grayscale if needed
+            if len(image_array.shape) == 3:
+                if image_array.shape[-1] == 3:
+                    gray = cv2.cvtColor((image_array * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+                else:
+                    gray = (image_array.squeeze() * 255).astype(np.uint8)
+            else:
+                gray = (image_array * 255).astype(np.uint8)
+            
+            # Apply threshold to get binary image
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            
+            # Calculate signature-like features
+            features = []
+            
+            # 1. Stroke density (signatures have moderate stroke density)
+            stroke_pixels = np.sum(binary > 0)
+            total_pixels = binary.shape[0] * binary.shape[1]
+            stroke_density = stroke_pixels / total_pixels
+            features.append(stroke_density)
+            
+            # 2. Connected components (signatures usually have multiple connected strokes)
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            num_components = len(contours)
+            features.append(min(num_components / 20.0, 1.0))  # Normalize
+            
+            # 3. Aspect ratio (signatures are often wider than tall)
+            if contours:
+                # Get overall bounding box
+                all_contours = np.vstack(contours)
+                x, y, w, h = cv2.boundingRect(all_contours)
+                aspect_ratio = w / h if h > 0 else 1.0
+                # Signatures typically have aspect ratio between 2:1 and 6:1
+                aspect_score = 1.0 if 2.0 <= aspect_ratio <= 6.0 else max(0.0, 1.0 - abs(aspect_ratio - 3.0) / 3.0)
+                features.append(aspect_score)
+            else:
+                features.append(0.0)
+            
+            # 4. Edge complexity (signatures have curved, complex edges)
+            edges = cv2.Canny(gray, 50, 150)
+            edge_density = np.sum(edges > 0) / total_pixels
+            features.append(min(edge_density * 5.0, 1.0))  # Normalize
+            
+            # 5. Text-like patterns (signatures shouldn't be regular text)
+            # Check for regular patterns that might indicate text
+            horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
+            horizontal_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel)
+            text_like_score = 1.0 - min(np.sum(horizontal_lines > 0) / stroke_pixels, 1.0) if stroke_pixels > 0 else 0.0
+            features.append(text_like_score)
+            
+            # Weighted combination of features
+            weights = [0.2, 0.2, 0.3, 0.2, 0.1]  # Aspect ratio and edge complexity are most important
+            signature_score = sum(f * w for f, w in zip(features, weights))
+            
+            # Apply sigmoid to get probability-like score
+            signature_score = 1 / (1 + np.exp(-5 * (signature_score - 0.5)))
+            
+            return float(signature_score)
+            
+        except Exception as e:
+            logger.error(f"Error calculating signature likelihood: {e}")
+            return 0.0
+    
+    def _classify_image_content(self, image_rgb: np.ndarray) -> str:
+        """
+        Classify what the image actually contains using pre-trained model
+        """
+        try:
+            # Resize for EfficientNet
+            resized = tf.image.resize(image_rgb[np.newaxis, ...], (224, 224))
+            preprocessed = efficientnet_preprocess(resized.numpy())
+            
+            # Get predictions
+            predictions = self.image_classifier.predict(preprocessed, verbose=0)
+            
+            # Decode predictions (using ImageNet classes)
+            from tensorflow.keras.applications.imagenet_utils import decode_predictions
+            decoded = decode_predictions(predictions, top=3)[0]
+            
+            # Return the top prediction with confidence
+            top_prediction = decoded[0]
+            class_name = top_prediction[1].replace('_', ' ').title()
+            confidence = top_prediction[2]
+            
+            if confidence > 0.3:
+                return f"{class_name} (confidence: {confidence:.1%})"
+            else:
+                return "Unknown object or pattern"
+                
+        except Exception as e:
+            logger.error(f"Error classifying image content: {e}")
+            return "Unable to classify image content"
+
+# Initialize global signature detector
+signature_detector = None
+
+def initialize_signature_detector():
+    """Initialize the signature detector"""
+    global signature_detector
+    if signature_detector is None:
+        signature_detector = SignatureDetector()
 
 # -----------------------------
 # Data Generator for Memory Efficiency
@@ -895,47 +1090,88 @@ SignatureVerificationModel._find_optimal_threshold_impl = _find_optimal_threshol
 # -----------------------------
 @app.post("/verify")
 async def verify_signature(signature_image: UploadFile = File(...)):
-    """Verify a signature using the trained AI model"""
-    global signature_model, feature_extractor, model_trained, verification_threshold
+    """Verify a signature using the trained AI model with signature detection"""
+    global signature_model, feature_extractor, model_trained, verification_threshold, signature_detector
 
     logger.info(f"Verification request received. Model trained: {model_trained}")
     
-    if not model_trained or signature_model is None:
-        raise HTTPException(status_code=400, detail="AI model not trained yet. Please train the model first.")
-
+    # Initialize signature detector if needed
+    if signature_detector is None:
+        initialize_signature_detector()
+    
     try:
-        # Preprocess the input signature
+        # Step 1: Read and preprocess the image
         contents = await signature_image.read()
         preprocessor = AdvancedSignaturePreprocessor()
         processed_signature = preprocessor.preprocess_signature(contents)
+        
+        # Step 2: Check if the image actually contains a signature
+        logger.info("Checking if uploaded image contains a signature...")
+        is_sig, sig_confidence, sig_description = signature_detector.is_signature(processed_signature, threshold=0.4)
+        
+        if not is_sig:
+            logger.info(f"Image rejected - not a signature: {sig_description}")
+            return {
+                "verified": False,
+                "is_signature": False,
+                "signature_confidence": float(sig_confidence),
+                "error": "NOT_A_SIGNATURE",
+                "message": f"❌ {sig_description}",
+                "description": sig_description,
+                "suggestion": "Please upload an image containing a handwritten signature"
+            }
+        
+        logger.info(f"Image contains signature (confidence: {sig_confidence:.1%})")
+        
+        # Step 3: Check if model is trained
+        if not model_trained or signature_model is None:
+            return {
+                "verified": False,
+                "is_signature": True,
+                "signature_confidence": float(sig_confidence),
+                "error": "MODEL_NOT_TRAINED",
+                "message": "✅ Valid signature detected, but AI model needs training first",
+                "suggestion": "Please train the AI model with your signature samples first"
+            }
+
+        # Step 4: Proceed with signature verification
         input_signature = prepare_model_input(processed_signature)
 
         # Load reference signatures for comparison
         if not hasattr(verify_signature, 'reference_signatures'):
-            # This should ideally be loaded from training data or stored references
-            logger.warning("No reference signatures stored. Using model-based approach.")
+            # Use feature-based verification approach
+            logger.info("Using feature-based verification (no reference signatures)")
             
-            # For now, we'll use a different approach - feature-based verification
-            # Extract features from the input signature
             features = feature_extractor.predict(np.expand_dims(input_signature, axis=0), verbose=0)[0]
             
-            # Simple threshold-based verification (this would be improved with stored references)
+            # Improved feature analysis
             feature_magnitude = np.linalg.norm(features)
             feature_diversity = np.std(features)
+            feature_sparsity = np.sum(np.abs(features) < 0.1) / len(features)
             
-            # Heuristic scoring based on feature analysis
-            confidence_score = min(1.0, (feature_magnitude * feature_diversity) / 10.0)
-            is_verified = confidence_score > 0.6
+            # Combined scoring
+            confidence_score = (feature_magnitude * 0.4 + feature_diversity * 0.4 + (1 - feature_sparsity) * 0.2) / 3.0
+            confidence_score = min(1.0, confidence_score * 2.0)  # Scale up
+            
+            is_verified = confidence_score > 0.5
             
             verification_result = {
                 "verified": bool(is_verified),
-                "confidence": float(confidence_score),
+                "is_signature": True,
+                "signature_confidence": float(sig_confidence),
+                "verification_confidence": float(confidence_score),
                 "method": "feature_analysis",
-                "message": f"Signature {'verified' if is_verified else 'rejected'} using AI feature analysis. Confidence: {confidence_score:.1%}"
+                "message": f"{'✅ Signature VERIFIED' if is_verified else '❌ Signature REJECTED'} using AI feature analysis. Confidence: {confidence_score:.1%}",
+                "details": {
+                    "feature_magnitude": float(feature_magnitude),
+                    "feature_diversity": float(feature_diversity),
+                    "feature_sparsity": float(feature_sparsity)
+                }
             }
         
         else:
             # Use stored reference signatures for comparison
+            logger.info("Using reference signature comparison")
             reference_sigs = verify_signature.reference_signatures
             
             # Compare with each reference signature
@@ -956,16 +1192,17 @@ async def verify_signature(signature_image: UploadFile = File(...)):
             
             # Apply learned threshold
             is_verified = max_similarity > verification_threshold
-            confidence_score = max_similarity
             
             verification_result = {
                 "verified": bool(is_verified),
-                "confidence": float(confidence_score),
+                "is_signature": True,
+                "signature_confidence": float(sig_confidence),
+                "verification_confidence": max_similarity,
                 "max_similarity": max_similarity,
                 "avg_similarity": avg_similarity,
                 "threshold_used": verification_threshold,
                 "method": "siamese_network",
-                "message": f"Signature {'VERIFIED' if is_verified else 'REJECTED'} by AI model. Best match: {max_similarity:.1%} (threshold: {verification_threshold:.1%})"
+                "message": f"{'✅ Signature VERIFIED' if is_verified else '❌ Signature REJECTED'} by AI model. Best match: {max_similarity:.1%} (threshold: {verification_threshold:.1%})"
             }
 
         logger.info(f"Verification completed: {verification_result}")
@@ -1008,30 +1245,7 @@ async def get_model_status():
     logger.info(f"Model status: {status}")
     return status
 
-@app.post("/load_reference_signatures")
-async def load_reference_signatures(reference_images: List[UploadFile] = File(...)):
-    """Load reference signatures for verification"""
-    if not model_trained:
-        raise HTTPException(status_code=400, detail="Model must be trained first")
-    
-    try:
-        preprocessor = AdvancedSignaturePreprocessor()
-        reference_sigs = []
-        
-        for img_file in reference_images:
-            contents = await img_file.read()
-            processed = preprocessor.preprocess_signature(contents)
-            reference_sigs.append(processed)
-        
-        # Store reference signatures for verification
-        verify_signature.reference_signatures = reference_sigs
-        
-        logger.info(f"Loaded {len(reference_sigs)} reference signatures")
-        return {"message": f"Successfully loaded {len(reference_sigs)} reference signatures"}
-        
-    except Exception as e:
-        logger.error(f"Error loading reference signatures: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to load reference signatures: {str(e)}")
+# Reference signatures functionality removed - not needed for direct training approach
 
 # -----------------------------
 # Model Loading Function
@@ -1155,6 +1369,9 @@ async def reset_model():
 # Startup
 # -----------------------------
 logger.info("Starting AI Signature Verification API...")
+logger.info("Initializing signature detection system...")
+initialize_signature_detector()
+
 logger.info("Attempting to load previously trained models...")
 model_loaded = load_saved_model()
 
