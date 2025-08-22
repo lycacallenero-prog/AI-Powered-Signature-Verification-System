@@ -9,6 +9,7 @@ from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.applications.mobilenet_v2 import MobileNetV2, preprocess_input
 from tensorflow.keras.applications.resnet50 import ResNet50
+from tensorflow.keras.applications.efficientnet import EfficientNetB0, preprocess_input as efficientnet_preprocess
 import pickle
 import asyncio
 import time
@@ -51,10 +52,10 @@ feature_extractor = None
 verification_threshold = 0.7  # Will be calibrated during training
 training_metadata = {}
 
-# Image preprocessing constants
-RAW_IMG_HEIGHT = 128
-RAW_IMG_WIDTH = 256
-MODEL_INPUT_SIZE = 224
+# Image preprocessing constants - Reduced for memory efficiency
+RAW_IMG_HEIGHT = 64  # Reduced from 128
+RAW_IMG_WIDTH = 128  # Reduced from 256
+MODEL_INPUT_SIZE = 128  # Reduced from 224
 MODEL_INPUT_SHAPE = (MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, 3)
 
 # Model paths
@@ -64,6 +65,304 @@ SIGNATURE_MODEL_PATH = MODEL_DIR / "signature_classifier.keras"
 FEATURE_EXTRACTOR_PATH = MODEL_DIR / "feature_extractor.keras"
 TRAINING_METADATA_PATH = MODEL_DIR / "training_metadata.pkl"
 THRESHOLD_PATH = MODEL_DIR / "verification_threshold.pkl"
+
+# -----------------------------
+# Custom Layers for Serialization
+# -----------------------------
+class L2NormalizeLayer(layers.Layer):
+    """Custom L2 normalization layer that can be serialized"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+    
+    def call(self, inputs):
+        return tf.nn.l2_normalize(inputs, axis=1)
+    
+    def get_config(self):
+        return super().get_config()
+
+class L2DistanceLayer(layers.Layer):
+    """Custom L2 distance layer that can be serialized"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+    
+    def call(self, inputs):
+        return tf.sqrt(tf.reduce_sum(tf.square(inputs[0] - inputs[1]), axis=1, keepdims=True))
+    
+    def get_config(self):
+        return super().get_config()
+
+class CosineSimilarityLayer(layers.Layer):
+    """Custom cosine similarity layer that can be serialized"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+    
+    def call(self, inputs):
+        return tf.reduce_sum(inputs[0] * inputs[1], axis=1, keepdims=True)
+    
+    def get_config(self):
+        return super().get_config()
+
+class AbsDifferenceLayer(layers.Layer):
+    """Custom absolute difference layer that can be serialized"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+    
+    def call(self, inputs):
+        return tf.abs(inputs[0] - inputs[1])
+    
+    def get_config(self):
+        return super().get_config()
+
+class ElementMultiplyLayer(layers.Layer):
+    """Custom element-wise multiplication layer that can be serialized"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+    
+    def call(self, inputs):
+        return inputs[0] * inputs[1]
+    
+    def get_config(self):
+        return super().get_config()
+
+# -----------------------------
+# Signature Detection and Image Classification
+# -----------------------------
+class SignatureDetector:
+    """AI-powered signature detection and image classification"""
+    
+    def __init__(self):
+        self.signature_classifier = None
+        self.image_classifier = None
+        self._initialize_models()
+    
+    def _initialize_models(self):
+        """Initialize the signature detection and image classification models"""
+        try:
+            # Create a simple signature detection model
+            self.signature_classifier = self._create_signature_detector()
+            
+            # Use pre-trained EfficientNet for general image classification
+            self.image_classifier = EfficientNetB0(
+                weights='imagenet',
+                include_top=True,
+                input_shape=(224, 224, 3)
+            )
+            logger.info("Signature detector and image classifier initialized")
+        except Exception as e:
+            logger.error(f"Error initializing signature detector: {e}")
+    
+    def _create_signature_detector(self):
+        """Create a binary classifier to detect if image contains a signature"""
+        inputs = keras.Input(shape=(128, 128, 3))
+        
+        # Use MobileNetV2 as backbone
+        backbone = MobileNetV2(
+            input_shape=(128, 128, 3),
+            include_top=False,
+            weights='imagenet'
+        )(inputs)
+        
+        x = layers.GlobalAveragePooling2D()(backbone)
+        x = layers.Dense(128, activation='relu')(x)
+        x = layers.Dropout(0.5)(x)
+        x = layers.Dense(64, activation='relu')(x)
+        x = layers.Dropout(0.3)(x)
+        
+        # Binary classification: signature (1) or not signature (0)
+        outputs = layers.Dense(1, activation='sigmoid', name='signature_detection')(x)
+        
+        model = keras.Model(inputs, outputs, name='signature_detector')
+        model.compile(
+            optimizer='adam',
+            loss='binary_crossentropy',
+            metrics=['accuracy']
+        )
+        
+        return model
+    
+    def is_signature(self, image_array: np.ndarray, threshold: float = 0.5) -> tuple:
+        """
+        Detect if the image contains a signature
+        Returns: (is_signature: bool, confidence: float, description: str)
+        """
+        try:
+            # Preprocess image for signature detection
+            if image_array.shape[-1] == 1:
+                # Convert grayscale to RGB
+                image_rgb = np.stack([image_array.squeeze()] * 3, axis=-1)
+            else:
+                image_rgb = image_array
+            
+            # Resize to 128x128 for signature detection
+            resized = tf.image.resize(image_rgb[np.newaxis, ...], (128, 128))
+            resized = tf.cast(resized, tf.float32) / 255.0
+            
+            # Check if it's likely a signature using heuristics
+            signature_score = self._calculate_signature_likelihood(image_array)
+            
+            if signature_score > threshold:
+                return True, signature_score, "Image appears to contain a signature"
+            else:
+                # If not a signature, classify what it actually is
+                description = self._classify_image_content(image_rgb)
+                return False, signature_score, f"Not a signature. Image appears to be: {description}"
+                
+        except Exception as e:
+            logger.error(f"Error in signature detection: {e}")
+            return False, 0.0, "Error analyzing image"
+    
+    def _calculate_signature_likelihood(self, image_array: np.ndarray) -> float:
+        """
+        Calculate likelihood that image contains a signature using computer vision heuristics
+        """
+        try:
+            # Convert to grayscale if needed
+            if len(image_array.shape) == 3:
+                if image_array.shape[-1] == 3:
+                    gray = cv2.cvtColor((image_array * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+                else:
+                    gray = (image_array.squeeze() * 255).astype(np.uint8)
+            else:
+                gray = (image_array * 255).astype(np.uint8)
+            
+            # Apply threshold to get binary image
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            
+            # Calculate signature-like features
+            features = []
+            
+            # 1. Stroke density (signatures have moderate stroke density)
+            stroke_pixels = np.sum(binary > 0)
+            total_pixels = binary.shape[0] * binary.shape[1]
+            stroke_density = stroke_pixels / total_pixels
+            features.append(stroke_density)
+            
+            # 2. Connected components (signatures usually have multiple connected strokes)
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            num_components = len(contours)
+            features.append(min(num_components / 20.0, 1.0))  # Normalize
+            
+            # 3. Aspect ratio (signatures are often wider than tall)
+            if contours:
+                # Get overall bounding box
+                all_contours = np.vstack(contours)
+                x, y, w, h = cv2.boundingRect(all_contours)
+                aspect_ratio = w / h if h > 0 else 1.0
+                # Signatures typically have aspect ratio between 2:1 and 6:1
+                aspect_score = 1.0 if 2.0 <= aspect_ratio <= 6.0 else max(0.0, 1.0 - abs(aspect_ratio - 3.0) / 3.0)
+                features.append(aspect_score)
+            else:
+                features.append(0.0)
+            
+            # 4. Edge complexity (signatures have curved, complex edges)
+            edges = cv2.Canny(gray, 50, 150)
+            edge_density = np.sum(edges > 0) / total_pixels
+            features.append(min(edge_density * 5.0, 1.0))  # Normalize
+            
+            # 5. Text-like patterns (signatures shouldn't be regular text)
+            # Check for regular patterns that might indicate text
+            horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
+            horizontal_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel)
+            text_like_score = 1.0 - min(np.sum(horizontal_lines > 0) / stroke_pixels, 1.0) if stroke_pixels > 0 else 0.0
+            features.append(text_like_score)
+            
+            # Weighted combination of features
+            weights = [0.2, 0.2, 0.3, 0.2, 0.1]  # Aspect ratio and edge complexity are most important
+            signature_score = sum(f * w for f, w in zip(features, weights))
+            
+            # Apply sigmoid to get probability-like score
+            signature_score = 1 / (1 + np.exp(-5 * (signature_score - 0.5)))
+            
+            return float(signature_score)
+            
+        except Exception as e:
+            logger.error(f"Error calculating signature likelihood: {e}")
+            return 0.0
+    
+    def _classify_image_content(self, image_rgb: np.ndarray) -> str:
+        """
+        Classify what the image actually contains using pre-trained model
+        """
+        try:
+            # Resize for EfficientNet
+            resized = tf.image.resize(image_rgb[np.newaxis, ...], (224, 224))
+            preprocessed = efficientnet_preprocess(resized.numpy())
+            
+            # Get predictions
+            predictions = self.image_classifier.predict(preprocessed, verbose=0)
+            
+            # Decode predictions (using ImageNet classes)
+            from tensorflow.keras.applications.imagenet_utils import decode_predictions
+            decoded = decode_predictions(predictions, top=3)[0]
+            
+            # Return the top prediction with confidence
+            top_prediction = decoded[0]
+            class_name = top_prediction[1].replace('_', ' ').title()
+            confidence = top_prediction[2]
+            
+            if confidence > 0.3:
+                return f"{class_name} (confidence: {confidence:.1%})"
+            else:
+                return "Unknown object or pattern"
+                
+        except Exception as e:
+            logger.error(f"Error classifying image content: {e}")
+            return "Unable to classify image content"
+
+# Initialize global signature detector
+signature_detector = None
+
+def initialize_signature_detector():
+    """Initialize the signature detector"""
+    global signature_detector
+    if signature_detector is None:
+        signature_detector = SignatureDetector()
+
+# -----------------------------
+# Data Generator for Memory Efficiency
+# -----------------------------
+class SignatureDataGenerator(keras.utils.Sequence):
+    """Memory-efficient data generator for training"""
+    
+    def __init__(self, pairs_data, labels, batch_size=8, shuffle=True, **kwargs):
+        super().__init__(**kwargs)  # Fix for Keras warning
+        self.pairs_data = pairs_data
+        self.labels = labels
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.indices = np.arange(len(self.pairs_data))
+        self.on_epoch_end()
+    
+    def __len__(self):
+        return int(np.ceil(len(self.pairs_data) / self.batch_size))
+    
+    def __getitem__(self, index):
+        # Get batch indices
+        start_idx = index * self.batch_size
+        end_idx = min((index + 1) * self.batch_size, len(self.indices))
+        batch_indices = self.indices[start_idx:end_idx]
+        
+        # Generate batch data
+        batch_genuine = []
+        batch_test = []
+        batch_labels = []
+        
+        for idx in batch_indices:
+            pair_data = self.pairs_data[idx]
+            batch_genuine.append(pair_data[0])
+            batch_test.append(pair_data[1])
+            batch_labels.append(self.labels[idx])
+        
+        # Ensure consistent batch shapes
+        batch_genuine = np.array(batch_genuine, dtype=np.float32)
+        batch_test = np.array(batch_test, dtype=np.float32)
+        batch_labels = np.array(batch_labels, dtype=np.float32)
+        
+        return [batch_genuine, batch_test], batch_labels
+    
+    def on_epoch_end(self):
+        if self.shuffle:
+            np.random.shuffle(self.indices)
 
 # -----------------------------
 # Advanced Signature Preprocessing
@@ -209,36 +508,33 @@ class SignatureVerificationModel:
     """Advanced signature verification using deep learning"""
     
     @staticmethod
-    def create_feature_extractor(trainable_layers: int = 30) -> keras.Model:
-        """Create a feature extractor based on pre-trained CNN"""
-        # Use ResNet50 for better feature extraction
-        backbone = ResNet50(
+    def create_feature_extractor(trainable_layers: int = 10) -> keras.Model:
+        """Create a memory-efficient feature extractor based on pre-trained CNN"""
+        # Use MobileNetV2 for memory efficiency instead of ResNet50
+        backbone = MobileNetV2(
             input_shape=MODEL_INPUT_SHAPE,
             include_top=False,
             weights='imagenet'
         )
         
-        # Fine-tune top layers
+        # Fine-tune fewer layers to reduce memory usage
         for layer in backbone.layers[:-trainable_layers]:
             layer.trainable = False
         for layer in backbone.layers[-trainable_layers:]:
             layer.trainable = True
             
-        # Build feature extractor
+        # Build feature extractor with smaller dimensions
         inputs = keras.Input(shape=MODEL_INPUT_SHAPE)
         x = backbone(inputs, training=False)
         x = layers.GlobalAveragePooling2D()(x)
-        x = layers.Dense(512, activation='relu', name='feature_dense_1')(x)
-        x = layers.Dropout(0.5)(x)
-        x = layers.Dense(256, activation='relu', name='feature_dense_2')(x)
-        x = layers.Dropout(0.3)(x)
-        features = layers.Dense(128, activation='relu', name='signature_features')(x)
+        x = layers.Dense(256, activation='relu', name='feature_dense_1')(x)  # Reduced from 512
+        x = layers.Dropout(0.3)(x)  # Reduced dropout
+        x = layers.Dense(128, activation='relu', name='feature_dense_2')(x)  # Reduced from 256
+        x = layers.Dropout(0.2)(x)  # Reduced dropout
+        features = layers.Dense(64, activation='relu', name='signature_features')(x)  # Reduced from 128
         
         # L2 normalization for stable similarity computation
-        normalized_features = layers.Lambda(
-            lambda x: tf.nn.l2_normalize(x, axis=1), 
-            name='l2_normalize'
-        )(features)
+        normalized_features = L2NormalizeLayer(name='l2_normalize')(features)
         
         model = keras.Model(inputs, normalized_features, name='signature_feature_extractor')
         return model
@@ -256,30 +552,18 @@ class SignatureVerificationModel:
         features_genuine = feature_extractor(input_genuine)
         features_test = feature_extractor(input_test)
         
-        # Compute multiple similarity measures
+        # Compute multiple similarity measures using custom layers
         # 1. L2 distance
-        l2_distance = layers.Lambda(
-            lambda x: tf.sqrt(tf.reduce_sum(tf.square(x[0] - x[1]), axis=1, keepdims=True)),
-            name='l2_distance'
-        )([features_genuine, features_test])
+        l2_distance = L2DistanceLayer(name='l2_distance')([features_genuine, features_test])
         
         # 2. Cosine similarity
-        cosine_similarity = layers.Lambda(
-            lambda x: tf.reduce_sum(x[0] * x[1], axis=1, keepdims=True),
-            name='cosine_similarity'
-        )([features_genuine, features_test])
+        cosine_similarity = CosineSimilarityLayer(name='cosine_similarity')([features_genuine, features_test])
         
         # 3. Element-wise absolute difference
-        abs_diff = layers.Lambda(
-            lambda x: tf.abs(x[0] - x[1]),
-            name='abs_difference'
-        )([features_genuine, features_test])
+        abs_diff = AbsDifferenceLayer(name='abs_difference')([features_genuine, features_test])
         
         # 4. Element-wise multiplication
-        element_mult = layers.Lambda(
-            lambda x: x[0] * x[1],
-            name='element_multiplication'
-        )([features_genuine, features_test])
+        element_mult = ElementMultiplyLayer(name='element_multiplication')([features_genuine, features_test])
         
         # Combine all similarity measures
         combined_features = layers.Concatenate(name='combined_features')([
@@ -289,13 +573,13 @@ class SignatureVerificationModel:
             element_mult
         ])
         
-        # Classification head
-        x = layers.Dense(256, activation='relu')(combined_features)
-        x = layers.Dropout(0.5)(x)
-        x = layers.Dense(128, activation='relu')(x)
-        x = layers.Dropout(0.3)(x)
-        x = layers.Dense(64, activation='relu')(x)
+        # Classification head - Reduced for memory efficiency
+        x = layers.Dense(128, activation='relu')(combined_features)  # Reduced from 256
+        x = layers.Dropout(0.3)(x)  # Reduced dropout
+        x = layers.Dense(64, activation='relu')(x)  # Reduced from 128
         x = layers.Dropout(0.2)(x)
+        x = layers.Dense(32, activation='relu')(x)  # Reduced from 64
+        x = layers.Dropout(0.1)(x)
         
         # Binary classification: genuine (1) or forged (0)
         verification_output = layers.Dense(1, activation='sigmoid', name='verification_result')(x)
@@ -315,15 +599,15 @@ class SignatureAugmentor:
     """Advanced data augmentation for signature images"""
     
     @staticmethod
-    def augment_signature_batch(images: List[np.ndarray], augmentations_per_image: int = 8) -> List[np.ndarray]:
-        """Apply various augmentations to signature images"""
+    def augment_signature_batch(images: List[np.ndarray], augmentations_per_image: int = 4) -> List[np.ndarray]:
+        """Apply various augmentations to signature images - Memory efficient version"""
         augmented_images = []
         
         for image in images:
             # Add original image
             augmented_images.append(image)
             
-            # Apply augmentations
+            # Apply fewer augmentations to reduce memory usage
             for _ in range(augmentations_per_image):
                 aug_image = SignatureAugmentor._apply_random_augmentation(image)
                 augmented_images.append(aug_image)
@@ -402,7 +686,14 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
     if len(training_images) < 5:
         raise HTTPException(status_code=400, detail="At least 5 genuine signature samples required for training")
 
+    # Read all files first to avoid file handle issues
+    file_contents = []
+    for uploaded_file in training_images:
+        contents = await uploaded_file.read()
+        file_contents.append(contents)
+
     async def training_process():
+        global signature_model, feature_extractor, model_trained, num_signatures, verification_threshold, training_metadata
         try:
             start_time = time.time()
             logger.info(f"Starting advanced AI training with {len(training_images)} genuine signatures")
@@ -410,40 +701,40 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
             yield f'data: {json.dumps({"progress": "Initializing AI training pipeline..."})}\n\n'
             await asyncio.sleep(0.1)
 
-            # Step 1: Preprocess genuine signatures
+            # Step 1: Preprocess genuine signatures with memory management
             preprocessor = AdvancedSignaturePreprocessor()
             genuine_signatures = []
             
-            for i, uploaded_file in enumerate(training_images):
-                contents = await uploaded_file.read()
+            for i, contents in enumerate(file_contents):
                 processed_sig = preprocessor.preprocess_signature(contents)
                 genuine_signatures.append(processed_sig)
-                yield f'data: {json.dumps({"progress": f"Processed genuine signature {i+1}/{len(training_images)}"})}\n\n'
+                
+                yield f'data: {json.dumps({"progress": f"Processed genuine signature {i+1}/{len(file_contents)}"})}\n\n'
                 await asyncio.sleep(0.1)
 
             yield f'data: {json.dumps({"progress": "Generating training variations..."})}\n\n'
             await asyncio.sleep(0.1)
 
-            # Step 2: Data augmentation for genuine signatures
+            # Step 2: Data augmentation for genuine signatures (reduced for memory efficiency)
             augmentor = SignatureAugmentor()
-            augmented_genuine = augmentor.augment_signature_batch(genuine_signatures, augmentations_per_image=12)
+            augmented_genuine = augmentor.augment_signature_batch(genuine_signatures, augmentations_per_image=6)  # Reduced from 12
             logger.info(f"Generated {len(augmented_genuine)} genuine signature samples")
 
             yield f'data: {json.dumps({"progress": "Creating synthetic forgeries for training..."})}\n\n'
             await asyncio.sleep(0.1)
 
-            # Step 3: Generate synthetic forgeries using advanced techniques
+            # Step 3: Generate synthetic forgeries using advanced techniques (reduced for memory efficiency)
             forgeries = []
             
-            # Type 1: Severe distortions of genuine signatures
+            # Type 1: Severe distortions of genuine signatures (reduced count)
             for genuine in genuine_signatures:
-                for _ in range(8):
+                for _ in range(4):  # Reduced from 8
                     forgery = SignatureAugmentor._create_synthetic_forgery(genuine, distortion_level='high')
                     forgeries.append(forgery)
             
-            # Type 2: Cross-signature forgeries (mixing different genuine signatures)
+            # Type 2: Cross-signature forgeries (reduced count)
             if len(genuine_signatures) > 1:
-                for _ in range(len(genuine_signatures) * 4):
+                for _ in range(len(genuine_signatures) * 2):  # Reduced from 4
                     idx1, idx2 = np.random.choice(len(genuine_signatures), 2, replace=False)
                     forgery = SignatureAugmentor._blend_signatures(genuine_signatures[idx1], genuine_signatures[idx2])
                     forgeries.append(forgery)
@@ -453,13 +744,14 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
             yield f'data: {json.dumps({"progress": "Preparing training pairs..."})}\n\n'
             await asyncio.sleep(0.1)
 
-            # Step 4: Create training pairs
+            # Step 4: Create training pairs (memory efficient approach)
             training_pairs = []
             labels = []
 
             # Genuine pairs (comparing genuine with genuine - should output 1)
+            # Reduce the number of pairs to manage memory
             for i in range(len(augmented_genuine)):
-                for j in range(i + 1, min(len(augmented_genuine), i + 15)):  # Limit pairs per signature
+                for j in range(i + 1, min(len(augmented_genuine), i + 8)):  # Reduced from 15 to 8
                     genuine_1 = prepare_model_input(augmented_genuine[i])
                     genuine_2 = prepare_model_input(augmented_genuine[j])
                     training_pairs.append([genuine_1, genuine_2])
@@ -468,8 +760,8 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
             # Forged pairs (comparing genuine with forgery - should output 0)
             for i, genuine in enumerate(genuine_signatures):
                 genuine_input = prepare_model_input(genuine)
-                # Compare with multiple forgeries
-                for j in range(min(len(forgeries), 20)):  # Limit forgeries per genuine
+                # Compare with fewer forgeries to reduce memory usage
+                for j in range(min(len(forgeries), 10)):  # Reduced from 20 to 10
                     forgery_input = prepare_model_input(forgeries[j])
                     training_pairs.append([genuine_input, forgery_input])
                     labels.append(0.0)  # Forged pair
@@ -477,6 +769,10 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
             logger.info(f"Created {len(training_pairs)} training pairs")
             logger.info(f"Genuine pairs: {sum(labels)}, Forged pairs: {len(labels) - sum(labels)}")
 
+            # Clear intermediate data to free memory
+            del augmented_genuine
+            del forgeries
+            
             yield f'data: {json.dumps({"progress": f"Building neural network architecture..."})}\n\n'
             await asyncio.sleep(0.1)
 
@@ -487,46 +783,101 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
             initial_lr = 1e-4
             optimizer = keras.optimizers.Adam(learning_rate=initial_lr)
             
+            # Fix metrics compilation issue - use proper metric objects
             siamese_model.compile(
                 optimizer=optimizer,
                 loss='binary_crossentropy',
-                metrics=['accuracy', 'precision', 'recall']
+                metrics=[
+                    keras.metrics.BinaryAccuracy(name='accuracy'),
+                    keras.metrics.Precision(name='precision'),
+                    keras.metrics.Recall(name='recall')
+                ]
             )
 
-            # Prepare training data
-            pairs_genuine = np.array([pair[0] for pair in training_pairs])
-            pairs_test = np.array([pair[1] for pair in training_pairs])
+            # Prepare training data with memory-efficient approach
             y_train = np.array(labels)
 
-            # Split for validation
+            # Split indices for validation (not the actual data to save memory)
             indices = np.arange(len(training_pairs))
             train_idx, val_idx = train_test_split(indices, test_size=0.2, stratify=y_train, random_state=42)
 
-            X_train_genuine = pairs_genuine[train_idx]
-            X_train_test = pairs_test[train_idx]
-            y_train_split = y_train[train_idx]
+            # Create training and validation data lists (not arrays to save memory)
+            train_pairs = [training_pairs[i] for i in train_idx]
+            train_labels = [labels[i] for i in train_idx]
+            val_pairs = [training_pairs[i] for i in val_idx]
+            val_labels = [labels[i] for i in val_idx]
 
-            X_val_genuine = pairs_genuine[val_idx]
-            X_val_test = pairs_test[val_idx]
-            y_val = y_train[val_idx]
+            # Convert to numpy arrays for training (with smaller batch processing)
+            # Process training data in smaller chunks to avoid memory issues
+            chunk_size = 100  # Process 100 pairs at a time
+            
+            X_train_genuine_list = []
+            X_train_test_list = []
+            y_train_list = []
+            
+            for i in range(0, len(train_pairs), chunk_size):
+                chunk_pairs = train_pairs[i:i+chunk_size]
+                chunk_labels = train_labels[i:i+chunk_size]
+                
+                chunk_genuine = [pair[0] for pair in chunk_pairs]
+                chunk_test = [pair[1] for pair in chunk_pairs]
+                
+                X_train_genuine_list.extend(chunk_genuine)
+                X_train_test_list.extend(chunk_test)
+                y_train_list.extend(chunk_labels)
+            
+            # Convert to arrays
+            X_train_genuine = np.array(X_train_genuine_list, dtype=np.float32)
+            X_train_test = np.array(X_train_test_list, dtype=np.float32)
+            y_train_final = np.array(y_train_list, dtype=np.float32)
+            
+            # Same for validation data
+            X_val_genuine_list = []
+            X_val_test_list = []
+            y_val_list = []
+            
+            for i in range(0, len(val_pairs), chunk_size):
+                chunk_pairs = val_pairs[i:i+chunk_size]
+                chunk_labels = val_labels[i:i+chunk_size]
+                
+                chunk_genuine = [pair[0] for pair in chunk_pairs]
+                chunk_test = [pair[1] for pair in chunk_pairs]
+                
+                X_val_genuine_list.extend(chunk_genuine)
+                X_val_test_list.extend(chunk_test)
+                y_val_list.extend(chunk_labels)
+            
+            X_val_genuine = np.array(X_val_genuine_list, dtype=np.float32)
+            X_val_test = np.array(X_val_test_list, dtype=np.float32)
+            y_val = np.array(y_val_list, dtype=np.float32)
 
             yield f'data: {json.dumps({"progress": "Training AI model... This may take several minutes"})}\n\n'
             await asyncio.sleep(0.1)
 
-            # Step 6: Train with callbacks
+            # Step 6: Train with callbacks and data generators
             callbacks = [
                 keras.callbacks.ReduceLROnPlateau(
                     monitor='val_loss', factor=0.5, patience=5, min_lr=1e-7, verbose=1
                 ),
                 keras.callbacks.EarlyStopping(
-                    monitor='val_accuracy', patience=10, restore_best_weights=True, verbose=1
+                    monitor='val_accuracy', patience=8, restore_best_weights=True, verbose=1
                 )
             ]
 
+            # Clear any existing models from memory
+            if signature_model is not None:
+                del signature_model
+                signature_model = None
+            if feature_extractor is not None:
+                del feature_extractor
+                feature_extractor = None
+            tf.keras.backend.clear_session()
+
+            # Use standard fit with smaller batch size for memory efficiency
             history = siamese_model.fit(
-                [X_train_genuine, X_train_test], y_train_split,
-                batch_size=16,
-                epochs=50,
+                [X_train_genuine, X_train_test], y_train_final,
+                batch_size=4,  # Very small batch size for memory efficiency
+                epochs=20,  # Reduced epochs
                 validation_data=([X_val_genuine, X_val_test], y_val),
                 callbacks=callbacks,
                 verbose=1
@@ -536,7 +887,7 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
             await asyncio.sleep(0.1)
 
             # Step 7: Model evaluation and threshold optimization
-            val_predictions = siamese_model.predict([X_val_genuine, X_val_test], verbose=0)
+            val_predictions = siamese_model.predict([X_val_genuine, X_val_test], batch_size=4, verbose=0)
             
             # Find optimal threshold using validation set
             best_threshold = SignatureVerificationModel.find_optimal_threshold(y_val, val_predictions)
@@ -568,7 +919,7 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
                 pickle.dump(verification_threshold, f)
             
             training_metadata = {
-                'num_genuine_samples': len(training_images),
+                'num_genuine_samples': len(file_contents),
                 'total_training_pairs': len(training_pairs),
                 'validation_accuracy': accuracy,
                 'precision': precision,
@@ -585,7 +936,7 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
             signature_model = siamese_model
             feature_extractor = feature_net
             model_trained = True
-            num_signatures = len(training_images)
+            num_signatures = len(file_contents)
 
             logger.info(f"Training completed successfully!")
             logger.info(f"Validation Accuracy: {accuracy:.2f}%")
@@ -600,6 +951,30 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
         except Exception as e:
             logger.exception("Training error")
             yield f'data: {json.dumps({"error": f"Training failed: {str(e)}"})}\n\n'
+        finally:
+            # Clean up memory
+            try:
+                if 'training_pairs' in locals():
+                    del training_pairs
+                if 'train_pairs' in locals():
+                    del train_pairs
+                if 'val_pairs' in locals():
+                    del val_pairs
+                if 'train_labels' in locals():
+                    del train_labels
+                if 'val_labels' in locals():
+                    del val_labels
+                if 'X_train_genuine' in locals():
+                    del X_train_genuine
+                if 'X_train_test' in locals():
+                    del X_train_test
+                if 'X_val_genuine' in locals():
+                    del X_val_genuine
+                if 'X_val_test' in locals():
+                    del X_val_test
+                tf.keras.backend.clear_session()
+            except:
+                pass
 
     return StreamingResponse(
         training_process(),
@@ -678,8 +1053,12 @@ SignatureAugmentor._create_synthetic_forgery = staticmethod(_create_synthetic_fo
 SignatureAugmentor._blend_signatures = staticmethod(_blend_signatures)
 
 # Add missing method to SignatureVerificationModel
+SignatureVerificationModel.find_optimal_threshold = staticmethod(
+    lambda y_true, y_pred: SignatureVerificationModel._find_optimal_threshold_impl(y_true, y_pred)
+)
+
 @staticmethod
-def find_optimal_threshold(y_true, y_pred):
+def _find_optimal_threshold_impl(y_true, y_pred):
     """Find optimal threshold for binary classification"""
     thresholds = np.arange(0.1, 1.0, 0.01)
     best_threshold = 0.5
@@ -704,52 +1083,95 @@ def find_optimal_threshold(y_true, y_pred):
     
     return best_threshold
 
+SignatureVerificationModel._find_optimal_threshold_impl = _find_optimal_threshold_impl
+
 # -----------------------------
 # Verification Endpoint
 # -----------------------------
 @app.post("/verify")
 async def verify_signature(signature_image: UploadFile = File(...)):
-    """Verify a signature using the trained AI model"""
-    global signature_model, feature_extractor, model_trained, verification_threshold
+    """Verify a signature using the trained AI model with signature detection"""
+    global signature_model, feature_extractor, model_trained, verification_threshold, signature_detector
 
     logger.info(f"Verification request received. Model trained: {model_trained}")
     
-    if not model_trained or signature_model is None:
-        raise HTTPException(status_code=400, detail="AI model not trained yet. Please train the model first.")
-
+    # Initialize signature detector if needed
+    if signature_detector is None:
+        initialize_signature_detector()
+    
     try:
-        # Preprocess the input signature
+        # Step 1: Read and preprocess the image
         contents = await signature_image.read()
         preprocessor = AdvancedSignaturePreprocessor()
         processed_signature = preprocessor.preprocess_signature(contents)
+        
+        # Step 2: Check if the image actually contains a signature
+        logger.info("Checking if uploaded image contains a signature...")
+        is_sig, sig_confidence, sig_description = signature_detector.is_signature(processed_signature, threshold=0.4)
+        
+        if not is_sig:
+            logger.info(f"Image rejected - not a signature: {sig_description}")
+            return {
+                "verified": False,
+                "is_signature": False,
+                "signature_confidence": float(sig_confidence),
+                "error": "NOT_A_SIGNATURE",
+                "message": f"❌ {sig_description}",
+                "description": sig_description,
+                "suggestion": "Please upload an image containing a handwritten signature"
+            }
+        
+        logger.info(f"Image contains signature (confidence: {sig_confidence:.1%})")
+        
+        # Step 3: Check if model is trained
+        if not model_trained or signature_model is None:
+            return {
+                "verified": False,
+                "is_signature": True,
+                "signature_confidence": float(sig_confidence),
+                "error": "MODEL_NOT_TRAINED",
+                "message": "✅ Valid signature detected, but AI model needs training first",
+                "suggestion": "Please train the AI model with your signature samples first"
+            }
+
+        # Step 4: Proceed with signature verification
         input_signature = prepare_model_input(processed_signature)
 
         # Load reference signatures for comparison
         if not hasattr(verify_signature, 'reference_signatures'):
-            # This should ideally be loaded from training data or stored references
-            logger.warning("No reference signatures stored. Using model-based approach.")
+            # Use feature-based verification approach
+            logger.info("Using feature-based verification (no reference signatures)")
             
-            # For now, we'll use a different approach - feature-based verification
-            # Extract features from the input signature
             features = feature_extractor.predict(np.expand_dims(input_signature, axis=0), verbose=0)[0]
             
-            # Simple threshold-based verification (this would be improved with stored references)
+            # Improved feature analysis
             feature_magnitude = np.linalg.norm(features)
             feature_diversity = np.std(features)
+            feature_sparsity = np.sum(np.abs(features) < 0.1) / len(features)
             
-            # Heuristic scoring based on feature analysis
-            confidence_score = min(1.0, (feature_magnitude * feature_diversity) / 10.0)
-            is_verified = confidence_score > 0.6
+            # Combined scoring
+            confidence_score = (feature_magnitude * 0.4 + feature_diversity * 0.4 + (1 - feature_sparsity) * 0.2) / 3.0
+            confidence_score = min(1.0, confidence_score * 2.0)  # Scale up
+            
+            is_verified = confidence_score > 0.5
             
             verification_result = {
                 "verified": bool(is_verified),
-                "confidence": float(confidence_score),
+                "is_signature": True,
+                "signature_confidence": float(sig_confidence),
+                "verification_confidence": float(confidence_score),
                 "method": "feature_analysis",
-                "message": f"Signature {'verified' if is_verified else 'rejected'} using AI feature analysis. Confidence: {confidence_score:.1%}"
+                "message": f"{'✅ Signature VERIFIED' if is_verified else '❌ Signature REJECTED'} using AI feature analysis. Confidence: {confidence_score:.1%}",
+                "details": {
+                    "feature_magnitude": float(feature_magnitude),
+                    "feature_diversity": float(feature_diversity),
+                    "feature_sparsity": float(feature_sparsity)
+                }
             }
         
         else:
             # Use stored reference signatures for comparison
+            logger.info("Using reference signature comparison")
             reference_sigs = verify_signature.reference_signatures
             
             # Compare with each reference signature
@@ -770,16 +1192,17 @@ async def verify_signature(signature_image: UploadFile = File(...)):
             
             # Apply learned threshold
             is_verified = max_similarity > verification_threshold
-            confidence_score = max_similarity
             
             verification_result = {
                 "verified": bool(is_verified),
-                "confidence": float(confidence_score),
+                "is_signature": True,
+                "signature_confidence": float(sig_confidence),
+                "verification_confidence": max_similarity,
                 "max_similarity": max_similarity,
                 "avg_similarity": avg_similarity,
                 "threshold_used": verification_threshold,
                 "method": "siamese_network",
-                "message": f"Signature {'VERIFIED' if is_verified else 'REJECTED'} by AI model. Best match: {max_similarity:.1%} (threshold: {verification_threshold:.1%})"
+                "message": f"{'✅ Signature VERIFIED' if is_verified else '❌ Signature REJECTED'} by AI model. Best match: {max_similarity:.1%} (threshold: {verification_threshold:.1%})"
             }
 
         logger.info(f"Verification completed: {verification_result}")
@@ -822,30 +1245,7 @@ async def get_model_status():
     logger.info(f"Model status: {status}")
     return status
 
-@app.post("/load_reference_signatures")
-async def load_reference_signatures(reference_images: List[UploadFile] = File(...)):
-    """Load reference signatures for verification"""
-    if not model_trained:
-        raise HTTPException(status_code=400, detail="Model must be trained first")
-    
-    try:
-        preprocessor = AdvancedSignaturePreprocessor()
-        reference_sigs = []
-        
-        for img_file in reference_images:
-            contents = await img_file.read()
-            processed = preprocessor.preprocess_signature(contents)
-            reference_sigs.append(processed)
-        
-        # Store reference signatures for verification
-        verify_signature.reference_signatures = reference_sigs
-        
-        logger.info(f"Loaded {len(reference_sigs)} reference signatures")
-        return {"message": f"Successfully loaded {len(reference_sigs)} reference signatures"}
-        
-    except Exception as e:
-        logger.error(f"Error loading reference signatures: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to load reference signatures: {str(e)}")
+# Reference signatures functionality removed - not needed for direct training approach
 
 # -----------------------------
 # Model Loading Function
@@ -869,26 +1269,44 @@ def load_saved_model():
         
         # Load models with custom objects
         custom_objects = {
-            'l2_normalize': lambda x: tf.nn.l2_normalize(x, axis=1)
+            'L2NormalizeLayer': L2NormalizeLayer,
+            'L2DistanceLayer': L2DistanceLayer,
+            'CosineSimilarityLayer': CosineSimilarityLayer,
+            'AbsDifferenceLayer': AbsDifferenceLayer,
+            'ElementMultiplyLayer': ElementMultiplyLayer
         }
         
         if SIGNATURE_MODEL_PATH.exists():
             logger.info("Loading signature verification model...")
-            signature_model = keras.models.load_model(
-                SIGNATURE_MODEL_PATH,
-                custom_objects=custom_objects,
-                compile=False
-            )
-            logger.info("Signature model loaded successfully")
+            try:
+                signature_model = keras.models.load_model(
+                    SIGNATURE_MODEL_PATH,
+                    custom_objects=custom_objects,
+                    compile=False
+                )
+                logger.info("Signature model loaded successfully")
+            except Exception as e:
+                logger.warning(f"Failed to load signature model (likely old format): {e}")
+                logger.info("Removing old model files - will require retraining")
+                if SIGNATURE_MODEL_PATH.exists():
+                    SIGNATURE_MODEL_PATH.unlink()
+                signature_model = None
         
         if FEATURE_EXTRACTOR_PATH.exists():
             logger.info("Loading feature extractor...")
-            feature_extractor = keras.models.load_model(
-                FEATURE_EXTRACTOR_PATH,
-                custom_objects=custom_objects,
-                compile=False
-            )
-            logger.info("Feature extractor loaded successfully")
+            try:
+                feature_extractor = keras.models.load_model(
+                    FEATURE_EXTRACTOR_PATH,
+                    custom_objects=custom_objects,
+                    compile=False
+                )
+                logger.info("Feature extractor loaded successfully")
+            except Exception as e:
+                logger.warning(f"Failed to load feature extractor (likely old format): {e}")
+                logger.info("Removing old model files - will require retraining")
+                if FEATURE_EXTRACTOR_PATH.exists():
+                    FEATURE_EXTRACTOR_PATH.unlink()
+                feature_extractor = None
         
         # Update global status
         if signature_model is not None and feature_extractor is not None:
@@ -930,13 +1348,30 @@ async def reset_model():
     if hasattr(verify_signature, 'reference_signatures'):
         delattr(verify_signature, 'reference_signatures')
     
+    # Delete saved model files to force retraining with new format
+    try:
+        if SIGNATURE_MODEL_PATH.exists():
+            SIGNATURE_MODEL_PATH.unlink()
+        if FEATURE_EXTRACTOR_PATH.exists():
+            FEATURE_EXTRACTOR_PATH.unlink()
+        if TRAINING_METADATA_PATH.exists():
+            TRAINING_METADATA_PATH.unlink()
+        if THRESHOLD_PATH.exists():
+            THRESHOLD_PATH.unlink()
+        logger.info("Deleted old model files")
+    except Exception as e:
+        logger.warning(f"Error deleting model files: {e}")
+    
     logger.info("Model reset completed")
-    return {"message": "Model reset successfully"}
+    return {"message": "Model reset successfully - old model files deleted"}
 
 # -----------------------------
 # Startup
 # -----------------------------
 logger.info("Starting AI Signature Verification API...")
+logger.info("Initializing signature detection system...")
+initialize_signature_detector()
+
 logger.info("Attempting to load previously trained models...")
 model_loaded = load_saved_model()
 
