@@ -71,7 +71,8 @@ THRESHOLD_PATH = MODEL_DIR / "verification_threshold.pkl"
 class SignatureDataGenerator(keras.utils.Sequence):
     """Memory-efficient data generator for training"""
     
-    def __init__(self, pairs_data, labels, batch_size=8, shuffle=True):
+    def __init__(self, pairs_data, labels, batch_size=8, shuffle=True, **kwargs):
+        super().__init__(**kwargs)  # Fix for Keras warning
         self.pairs_data = pairs_data
         self.labels = labels
         self.batch_size = batch_size
@@ -99,7 +100,12 @@ class SignatureDataGenerator(keras.utils.Sequence):
             batch_test.append(pair_data[1])
             batch_labels.append(self.labels[idx])
         
-        return [np.array(batch_genuine), np.array(batch_test)], np.array(batch_labels)
+        # Ensure consistent batch shapes
+        batch_genuine = np.array(batch_genuine, dtype=np.float32)
+        batch_test = np.array(batch_test, dtype=np.float32)
+        batch_labels = np.array(batch_labels, dtype=np.float32)
+        
+        return [batch_genuine, batch_test], batch_labels
     
     def on_epoch_end(self):
         if self.shuffle:
@@ -562,9 +568,49 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
             val_pairs = [training_pairs[i] for i in val_idx]
             val_labels = [labels[i] for i in val_idx]
 
-            # Create data generators for memory efficiency
-            train_generator = SignatureDataGenerator(train_pairs, train_labels, batch_size=8, shuffle=True)
-            val_generator = SignatureDataGenerator(val_pairs, val_labels, batch_size=8, shuffle=False)
+            # Convert to numpy arrays for training (with smaller batch processing)
+            # Process training data in smaller chunks to avoid memory issues
+            chunk_size = 100  # Process 100 pairs at a time
+            
+            X_train_genuine_list = []
+            X_train_test_list = []
+            y_train_list = []
+            
+            for i in range(0, len(train_pairs), chunk_size):
+                chunk_pairs = train_pairs[i:i+chunk_size]
+                chunk_labels = train_labels[i:i+chunk_size]
+                
+                chunk_genuine = [pair[0] for pair in chunk_pairs]
+                chunk_test = [pair[1] for pair in chunk_pairs]
+                
+                X_train_genuine_list.extend(chunk_genuine)
+                X_train_test_list.extend(chunk_test)
+                y_train_list.extend(chunk_labels)
+            
+            # Convert to arrays
+            X_train_genuine = np.array(X_train_genuine_list, dtype=np.float32)
+            X_train_test = np.array(X_train_test_list, dtype=np.float32)
+            y_train_final = np.array(y_train_list, dtype=np.float32)
+            
+            # Same for validation data
+            X_val_genuine_list = []
+            X_val_test_list = []
+            y_val_list = []
+            
+            for i in range(0, len(val_pairs), chunk_size):
+                chunk_pairs = val_pairs[i:i+chunk_size]
+                chunk_labels = val_labels[i:i+chunk_size]
+                
+                chunk_genuine = [pair[0] for pair in chunk_pairs]
+                chunk_test = [pair[1] for pair in chunk_pairs]
+                
+                X_val_genuine_list.extend(chunk_genuine)
+                X_val_test_list.extend(chunk_test)
+                y_val_list.extend(chunk_labels)
+            
+            X_val_genuine = np.array(X_val_genuine_list, dtype=np.float32)
+            X_val_test = np.array(X_val_test_list, dtype=np.float32)
+            y_val = np.array(y_val_list, dtype=np.float32)
 
             yield f'data: {json.dumps({"progress": "Training AI model... This may take several minutes"})}\n\n'
             await asyncio.sleep(0.1)
@@ -589,11 +635,12 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
                 feature_extractor = None
             tf.keras.backend.clear_session()
 
-            # Use fit with generators for memory efficiency
+            # Use standard fit with smaller batch size for memory efficiency
             history = siamese_model.fit(
-                train_generator,
-                epochs=25,  # Further reduced for memory efficiency
-                validation_data=val_generator,
+                [X_train_genuine, X_train_test], y_train_final,
+                batch_size=4,  # Very small batch size for memory efficiency
+                epochs=20,  # Reduced epochs
+                validation_data=([X_val_genuine, X_val_test], y_val),
                 callbacks=callbacks,
                 verbose=1
             )
@@ -602,19 +649,7 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
             await asyncio.sleep(0.1)
 
             # Step 7: Model evaluation and threshold optimization
-            # Get validation data for threshold optimization
-            val_genuine_batch = []
-            val_test_batch = []
-            val_labels_batch = []
-            
-            for i in range(len(val_generator)):
-                batch_data, batch_labels = val_generator[i]
-                val_genuine_batch.extend(batch_data[0])
-                val_test_batch.extend(batch_data[1])
-                val_labels_batch.extend(batch_labels)
-            
-            val_predictions = siamese_model.predict([np.array(val_genuine_batch), np.array(val_test_batch)], verbose=0)
-            y_val = np.array(val_labels_batch)
+            val_predictions = siamese_model.predict([X_val_genuine, X_val_test], batch_size=4, verbose=0)
             
             # Find optimal threshold using validation set
             best_threshold = SignatureVerificationModel.find_optimal_threshold(y_val, val_predictions)
@@ -681,15 +716,24 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
         finally:
             # Clean up memory
             try:
-                del training_pairs
-                del train_pairs
-                del val_pairs
-                del train_labels
-                del val_labels
-                if 'val_genuine_batch' in locals():
-                    del val_genuine_batch
-                    del val_test_batch
-                    del val_labels_batch
+                if 'training_pairs' in locals():
+                    del training_pairs
+                if 'train_pairs' in locals():
+                    del train_pairs
+                if 'val_pairs' in locals():
+                    del val_pairs
+                if 'train_labels' in locals():
+                    del train_labels
+                if 'val_labels' in locals():
+                    del val_labels
+                if 'X_train_genuine' in locals():
+                    del X_train_genuine
+                if 'X_train_test' in locals():
+                    del X_train_test
+                if 'X_val_genuine' in locals():
+                    del X_val_genuine
+                if 'X_val_test' in locals():
+                    del X_val_test
                 tf.keras.backend.clear_session()
             except:
                 pass
