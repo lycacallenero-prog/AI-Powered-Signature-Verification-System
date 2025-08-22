@@ -51,10 +51,10 @@ feature_extractor = None
 verification_threshold = 0.7  # Will be calibrated during training
 training_metadata = {}
 
-# Image preprocessing constants
-RAW_IMG_HEIGHT = 128
-RAW_IMG_WIDTH = 256
-MODEL_INPUT_SIZE = 224
+# Image preprocessing constants - Reduced for memory efficiency
+RAW_IMG_HEIGHT = 64  # Reduced from 128
+RAW_IMG_WIDTH = 128  # Reduced from 256
+MODEL_INPUT_SIZE = 128  # Reduced from 224
 MODEL_INPUT_SHAPE = (MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, 3)
 
 # Model paths
@@ -64,6 +64,46 @@ SIGNATURE_MODEL_PATH = MODEL_DIR / "signature_classifier.keras"
 FEATURE_EXTRACTOR_PATH = MODEL_DIR / "feature_extractor.keras"
 TRAINING_METADATA_PATH = MODEL_DIR / "training_metadata.pkl"
 THRESHOLD_PATH = MODEL_DIR / "verification_threshold.pkl"
+
+# -----------------------------
+# Data Generator for Memory Efficiency
+# -----------------------------
+class SignatureDataGenerator(keras.utils.Sequence):
+    """Memory-efficient data generator for training"""
+    
+    def __init__(self, pairs_data, labels, batch_size=8, shuffle=True):
+        self.pairs_data = pairs_data
+        self.labels = labels
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.indices = np.arange(len(self.pairs_data))
+        self.on_epoch_end()
+    
+    def __len__(self):
+        return int(np.ceil(len(self.pairs_data) / self.batch_size))
+    
+    def __getitem__(self, index):
+        # Get batch indices
+        start_idx = index * self.batch_size
+        end_idx = min((index + 1) * self.batch_size, len(self.indices))
+        batch_indices = self.indices[start_idx:end_idx]
+        
+        # Generate batch data
+        batch_genuine = []
+        batch_test = []
+        batch_labels = []
+        
+        for idx in batch_indices:
+            pair_data = self.pairs_data[idx]
+            batch_genuine.append(pair_data[0])
+            batch_test.append(pair_data[1])
+            batch_labels.append(self.labels[idx])
+        
+        return [np.array(batch_genuine), np.array(batch_test)], np.array(batch_labels)
+    
+    def on_epoch_end(self):
+        if self.shuffle:
+            np.random.shuffle(self.indices)
 
 # -----------------------------
 # Advanced Signature Preprocessing
@@ -209,30 +249,30 @@ class SignatureVerificationModel:
     """Advanced signature verification using deep learning"""
     
     @staticmethod
-    def create_feature_extractor(trainable_layers: int = 30) -> keras.Model:
-        """Create a feature extractor based on pre-trained CNN"""
-        # Use ResNet50 for better feature extraction
-        backbone = ResNet50(
+    def create_feature_extractor(trainable_layers: int = 10) -> keras.Model:
+        """Create a memory-efficient feature extractor based on pre-trained CNN"""
+        # Use MobileNetV2 for memory efficiency instead of ResNet50
+        backbone = MobileNetV2(
             input_shape=MODEL_INPUT_SHAPE,
             include_top=False,
             weights='imagenet'
         )
         
-        # Fine-tune top layers
+        # Fine-tune fewer layers to reduce memory usage
         for layer in backbone.layers[:-trainable_layers]:
             layer.trainable = False
         for layer in backbone.layers[-trainable_layers:]:
             layer.trainable = True
             
-        # Build feature extractor
+        # Build feature extractor with smaller dimensions
         inputs = keras.Input(shape=MODEL_INPUT_SHAPE)
         x = backbone(inputs, training=False)
         x = layers.GlobalAveragePooling2D()(x)
-        x = layers.Dense(512, activation='relu', name='feature_dense_1')(x)
-        x = layers.Dropout(0.5)(x)
-        x = layers.Dense(256, activation='relu', name='feature_dense_2')(x)
-        x = layers.Dropout(0.3)(x)
-        features = layers.Dense(128, activation='relu', name='signature_features')(x)
+        x = layers.Dense(256, activation='relu', name='feature_dense_1')(x)  # Reduced from 512
+        x = layers.Dropout(0.3)(x)  # Reduced dropout
+        x = layers.Dense(128, activation='relu', name='feature_dense_2')(x)  # Reduced from 256
+        x = layers.Dropout(0.2)(x)  # Reduced dropout
+        features = layers.Dense(64, activation='relu', name='signature_features')(x)  # Reduced from 128
         
         # L2 normalization for stable similarity computation
         normalized_features = layers.Lambda(
@@ -289,13 +329,13 @@ class SignatureVerificationModel:
             element_mult
         ])
         
-        # Classification head
-        x = layers.Dense(256, activation='relu')(combined_features)
-        x = layers.Dropout(0.5)(x)
-        x = layers.Dense(128, activation='relu')(x)
-        x = layers.Dropout(0.3)(x)
-        x = layers.Dense(64, activation='relu')(x)
+        # Classification head - Reduced for memory efficiency
+        x = layers.Dense(128, activation='relu')(combined_features)  # Reduced from 256
+        x = layers.Dropout(0.3)(x)  # Reduced dropout
+        x = layers.Dense(64, activation='relu')(x)  # Reduced from 128
         x = layers.Dropout(0.2)(x)
+        x = layers.Dense(32, activation='relu')(x)  # Reduced from 64
+        x = layers.Dropout(0.1)(x)
         
         # Binary classification: genuine (1) or forged (0)
         verification_output = layers.Dense(1, activation='sigmoid', name='verification_result')(x)
@@ -315,15 +355,15 @@ class SignatureAugmentor:
     """Advanced data augmentation for signature images"""
     
     @staticmethod
-    def augment_signature_batch(images: List[np.ndarray], augmentations_per_image: int = 8) -> List[np.ndarray]:
-        """Apply various augmentations to signature images"""
+    def augment_signature_batch(images: List[np.ndarray], augmentations_per_image: int = 4) -> List[np.ndarray]:
+        """Apply various augmentations to signature images - Memory efficient version"""
         augmented_images = []
         
         for image in images:
             # Add original image
             augmented_images.append(image)
             
-            # Apply augmentations
+            # Apply fewer augmentations to reduce memory usage
             for _ in range(augmentations_per_image):
                 aug_image = SignatureAugmentor._apply_random_augmentation(image)
                 augmented_images.append(aug_image)
@@ -402,6 +442,12 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
     if len(training_images) < 5:
         raise HTTPException(status_code=400, detail="At least 5 genuine signature samples required for training")
 
+    # Read all files first to avoid file handle issues
+    file_contents = []
+    for uploaded_file in training_images:
+        contents = await uploaded_file.read()
+        file_contents.append(contents)
+
     async def training_process():
         try:
             start_time = time.time()
@@ -410,40 +456,40 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
             yield f'data: {json.dumps({"progress": "Initializing AI training pipeline..."})}\n\n'
             await asyncio.sleep(0.1)
 
-            # Step 1: Preprocess genuine signatures
+            # Step 1: Preprocess genuine signatures with memory management
             preprocessor = AdvancedSignaturePreprocessor()
             genuine_signatures = []
             
-            for i, uploaded_file in enumerate(training_images):
-                contents = await uploaded_file.read()
+            for i, contents in enumerate(file_contents):
                 processed_sig = preprocessor.preprocess_signature(contents)
                 genuine_signatures.append(processed_sig)
+                
                 yield f'data: {json.dumps({"progress": f"Processed genuine signature {i+1}/{len(training_images)}"})}\n\n'
                 await asyncio.sleep(0.1)
 
             yield f'data: {json.dumps({"progress": "Generating training variations..."})}\n\n'
             await asyncio.sleep(0.1)
 
-            # Step 2: Data augmentation for genuine signatures
+            # Step 2: Data augmentation for genuine signatures (reduced for memory efficiency)
             augmentor = SignatureAugmentor()
-            augmented_genuine = augmentor.augment_signature_batch(genuine_signatures, augmentations_per_image=12)
+            augmented_genuine = augmentor.augment_signature_batch(genuine_signatures, augmentations_per_image=6)  # Reduced from 12
             logger.info(f"Generated {len(augmented_genuine)} genuine signature samples")
 
             yield f'data: {json.dumps({"progress": "Creating synthetic forgeries for training..."})}\n\n'
             await asyncio.sleep(0.1)
 
-            # Step 3: Generate synthetic forgeries using advanced techniques
+            # Step 3: Generate synthetic forgeries using advanced techniques (reduced for memory efficiency)
             forgeries = []
             
-            # Type 1: Severe distortions of genuine signatures
+            # Type 1: Severe distortions of genuine signatures (reduced count)
             for genuine in genuine_signatures:
-                for _ in range(8):
+                for _ in range(4):  # Reduced from 8
                     forgery = SignatureAugmentor._create_synthetic_forgery(genuine, distortion_level='high')
                     forgeries.append(forgery)
             
-            # Type 2: Cross-signature forgeries (mixing different genuine signatures)
+            # Type 2: Cross-signature forgeries (reduced count)
             if len(genuine_signatures) > 1:
-                for _ in range(len(genuine_signatures) * 4):
+                for _ in range(len(genuine_signatures) * 2):  # Reduced from 4
                     idx1, idx2 = np.random.choice(len(genuine_signatures), 2, replace=False)
                     forgery = SignatureAugmentor._blend_signatures(genuine_signatures[idx1], genuine_signatures[idx2])
                     forgeries.append(forgery)
@@ -453,13 +499,14 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
             yield f'data: {json.dumps({"progress": "Preparing training pairs..."})}\n\n'
             await asyncio.sleep(0.1)
 
-            # Step 4: Create training pairs
+            # Step 4: Create training pairs (memory efficient approach)
             training_pairs = []
             labels = []
 
             # Genuine pairs (comparing genuine with genuine - should output 1)
+            # Reduce the number of pairs to manage memory
             for i in range(len(augmented_genuine)):
-                for j in range(i + 1, min(len(augmented_genuine), i + 15)):  # Limit pairs per signature
+                for j in range(i + 1, min(len(augmented_genuine), i + 8)):  # Reduced from 15 to 8
                     genuine_1 = prepare_model_input(augmented_genuine[i])
                     genuine_2 = prepare_model_input(augmented_genuine[j])
                     training_pairs.append([genuine_1, genuine_2])
@@ -468,8 +515,8 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
             # Forged pairs (comparing genuine with forgery - should output 0)
             for i, genuine in enumerate(genuine_signatures):
                 genuine_input = prepare_model_input(genuine)
-                # Compare with multiple forgeries
-                for j in range(min(len(forgeries), 20)):  # Limit forgeries per genuine
+                # Compare with fewer forgeries to reduce memory usage
+                for j in range(min(len(forgeries), 10)):  # Reduced from 20 to 10
                     forgery_input = prepare_model_input(forgeries[j])
                     training_pairs.append([genuine_input, forgery_input])
                     labels.append(0.0)  # Forged pair
@@ -477,6 +524,10 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
             logger.info(f"Created {len(training_pairs)} training pairs")
             logger.info(f"Genuine pairs: {sum(labels)}, Forged pairs: {len(labels) - sum(labels)}")
 
+            # Clear intermediate data to free memory
+            del augmented_genuine
+            del forgeries
+            
             yield f'data: {json.dumps({"progress": f"Building neural network architecture..."})}\n\n'
             await asyncio.sleep(0.1)
 
@@ -487,47 +538,59 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
             initial_lr = 1e-4
             optimizer = keras.optimizers.Adam(learning_rate=initial_lr)
             
+            # Fix metrics compilation issue - use proper metric objects
             siamese_model.compile(
                 optimizer=optimizer,
                 loss='binary_crossentropy',
-                metrics=['accuracy', 'precision', 'recall']
+                metrics=[
+                    keras.metrics.BinaryAccuracy(name='accuracy'),
+                    keras.metrics.Precision(name='precision'),
+                    keras.metrics.Recall(name='recall')
+                ]
             )
 
-            # Prepare training data
-            pairs_genuine = np.array([pair[0] for pair in training_pairs])
-            pairs_test = np.array([pair[1] for pair in training_pairs])
+            # Prepare training data with memory-efficient approach
             y_train = np.array(labels)
 
-            # Split for validation
+            # Split indices for validation (not the actual data to save memory)
             indices = np.arange(len(training_pairs))
             train_idx, val_idx = train_test_split(indices, test_size=0.2, stratify=y_train, random_state=42)
 
-            X_train_genuine = pairs_genuine[train_idx]
-            X_train_test = pairs_test[train_idx]
-            y_train_split = y_train[train_idx]
+            # Create training and validation data lists (not arrays to save memory)
+            train_pairs = [training_pairs[i] for i in train_idx]
+            train_labels = [labels[i] for i in train_idx]
+            val_pairs = [training_pairs[i] for i in val_idx]
+            val_labels = [labels[i] for i in val_idx]
 
-            X_val_genuine = pairs_genuine[val_idx]
-            X_val_test = pairs_test[val_idx]
-            y_val = y_train[val_idx]
+            # Create data generators for memory efficiency
+            train_generator = SignatureDataGenerator(train_pairs, train_labels, batch_size=8, shuffle=True)
+            val_generator = SignatureDataGenerator(val_pairs, val_labels, batch_size=8, shuffle=False)
 
             yield f'data: {json.dumps({"progress": "Training AI model... This may take several minutes"})}\n\n'
             await asyncio.sleep(0.1)
 
-            # Step 6: Train with callbacks
+            # Step 6: Train with callbacks and data generators
             callbacks = [
                 keras.callbacks.ReduceLROnPlateau(
                     monitor='val_loss', factor=0.5, patience=5, min_lr=1e-7, verbose=1
                 ),
                 keras.callbacks.EarlyStopping(
-                    monitor='val_accuracy', patience=10, restore_best_weights=True, verbose=1
+                    monitor='val_accuracy', patience=8, restore_best_weights=True, verbose=1
                 )
             ]
 
+            # Clear any existing models from memory
+            if 'signature_model' in globals() and signature_model is not None:
+                del signature_model
+            if 'feature_extractor' in globals() and feature_extractor is not None:
+                del feature_extractor
+            tf.keras.backend.clear_session()
+
+            # Use fit with generators for memory efficiency
             history = siamese_model.fit(
-                [X_train_genuine, X_train_test], y_train_split,
-                batch_size=16,
-                epochs=50,
-                validation_data=([X_val_genuine, X_val_test], y_val),
+                train_generator,
+                epochs=25,  # Further reduced for memory efficiency
+                validation_data=val_generator,
                 callbacks=callbacks,
                 verbose=1
             )
@@ -536,7 +599,19 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
             await asyncio.sleep(0.1)
 
             # Step 7: Model evaluation and threshold optimization
-            val_predictions = siamese_model.predict([X_val_genuine, X_val_test], verbose=0)
+            # Get validation data for threshold optimization
+            val_genuine_batch = []
+            val_test_batch = []
+            val_labels_batch = []
+            
+            for i in range(len(val_generator)):
+                batch_data, batch_labels = val_generator[i]
+                val_genuine_batch.extend(batch_data[0])
+                val_test_batch.extend(batch_data[1])
+                val_labels_batch.extend(batch_labels)
+            
+            val_predictions = siamese_model.predict([np.array(val_genuine_batch), np.array(val_test_batch)], verbose=0)
+            y_val = np.array(val_labels_batch)
             
             # Find optimal threshold using validation set
             best_threshold = SignatureVerificationModel.find_optimal_threshold(y_val, val_predictions)
@@ -600,6 +675,21 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
         except Exception as e:
             logger.exception("Training error")
             yield f'data: {json.dumps({"error": f"Training failed: {str(e)}"})}\n\n'
+        finally:
+            # Clean up memory
+            try:
+                del training_pairs
+                del train_pairs
+                del val_pairs
+                del train_labels
+                del val_labels
+                if 'val_genuine_batch' in locals():
+                    del val_genuine_batch
+                    del val_test_batch
+                    del val_labels_batch
+                tf.keras.backend.clear_session()
+            except:
+                pass
 
     return StreamingResponse(
         training_process(),
@@ -678,8 +768,12 @@ SignatureAugmentor._create_synthetic_forgery = staticmethod(_create_synthetic_fo
 SignatureAugmentor._blend_signatures = staticmethod(_blend_signatures)
 
 # Add missing method to SignatureVerificationModel
+SignatureVerificationModel.find_optimal_threshold = staticmethod(
+    lambda y_true, y_pred: SignatureVerificationModel._find_optimal_threshold_impl(y_true, y_pred)
+)
+
 @staticmethod
-def find_optimal_threshold(y_true, y_pred):
+def _find_optimal_threshold_impl(y_true, y_pred):
     """Find optimal threshold for binary classification"""
     thresholds = np.arange(0.1, 1.0, 0.01)
     best_threshold = 0.5
@@ -703,6 +797,8 @@ def find_optimal_threshold(y_true, y_pred):
                 best_threshold = threshold
     
     return best_threshold
+
+SignatureVerificationModel._find_optimal_threshold_impl = _find_optimal_threshold_impl
 
 # -----------------------------
 # Verification Endpoint
