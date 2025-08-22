@@ -3,12 +3,22 @@ import { Upload, FileImage, Brain, Shield, CheckCircle, XCircle, Loader, Target,
 
 interface VerificationResult {
   verified: boolean;
-  confidence: number;
+  is_signature: boolean;
+  signature_confidence?: number;
+  verification_confidence?: number;
   message: string;
+  description?: string;
+  suggestion?: string;
+  error?: string;
   max_similarity?: number;
   avg_similarity?: number;
   threshold_used?: number;
   method?: string;
+  details?: {
+    feature_magnitude?: number;
+    feature_diversity?: number;
+    feature_sparsity?: number;
+  };
 }
 
 interface ModelStatus {
@@ -30,7 +40,6 @@ interface ModelStatus {
 
 const App: React.FC = () => {
   const [trainingFiles, setTrainingFiles] = useState<File[]>([]);
-  const [referenceFiles, setReferenceFiles] = useState<File[]>([]);
   const [verificationFile, setVerificationFile] = useState<File | null>(null);
   const [isTraining, setIsTraining] = useState(false);
   const [isVerifying, setIsVerifying] = useState(false);
@@ -42,7 +51,6 @@ const App: React.FC = () => {
   const [verificationResult, setVerificationResult] = useState<VerificationResult | null>(null);
   const [trainingProgress, setTrainingProgress] = useState<string>('');
   const [connectionStatus, setConnectionStatus] = useState<string>('Checking connection...');
-  const [referencesLoaded, setReferencesLoaded] = useState(false);
 
   // API base URL
   const API_BASE = 'http://localhost:8000';
@@ -117,12 +125,7 @@ const App: React.FC = () => {
     }
   };
 
-  const handleReferenceFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const files = event.target.files;
-    if (files) {
-      setReferenceFiles(Array.from(files));
-    }
-  };
+  // Reference functionality removed - simplified workflow
 
   const handleVerificationFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -208,53 +211,16 @@ const App: React.FC = () => {
     }
   };
 
-  const loadReferenceSignatures = async () => {
-    if (referenceFiles.length === 0) {
-      alert('Please select reference signatures first');
-      return;
-    }
-
-    if (!modelStatus.trained) {
-      alert('Please train the AI model first');
-      return;
-    }
-
-    const formData = new FormData();
-    referenceFiles.forEach((file) => {
-      formData.append('reference_images', file);
-    });
-
-    try {
-      const response = await fetch(`${API_BASE}/load_reference_signatures`, {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Failed to load references: ${errorText}`);
-      }
-
-      const result = await response.json();
-      setReferencesLoaded(true);
-      alert(result.message);
-    } catch (error: unknown) {
-      console.error('Error loading references:', error);
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      alert(`Failed to load references: ${errorMessage}`);
-    }
-  };
+  // Reference loading functionality removed - simplified workflow
 
   const verifySignature = async () => {
     if (!verificationFile) {
-      alert('Please upload a signature to verify');
+      alert('Please upload an image to verify');
       return;
     }
 
-    if (!modelStatus.trained) {
-      alert('Please train the AI model first');
-      return;
-    }
+    // Note: We no longer require model to be trained first
+    // The system will detect signatures and provide appropriate feedback
 
     setIsVerifying(true);
     setVerificationResult(null);
@@ -296,11 +262,9 @@ const App: React.FC = () => {
       try {
         await fetch(`${API_BASE}/reset_model`, { method: 'DELETE' });
         setTrainingFiles([]);
-        setReferenceFiles([]);
         setVerificationFile(null);
         setVerificationResult(null);
         setTrainingProgress('');
-        setReferencesLoaded(false);
         await checkModelStatus();
         alert('AI model reset successfully');
       } catch (error) {
@@ -500,76 +464,7 @@ const App: React.FC = () => {
             </div>
           </div>
 
-          {/* Reference Loading Section */}
-          <div className="bg-slate-800/50 backdrop-blur-sm rounded-2xl border border-slate-700 p-6">
-            <div className="flex items-center gap-3 mb-6">
-              <Target className="h-6 w-6 text-cyan-400" />
-              <h2 className="text-2xl font-semibold text-white">Reference Setup</h2>
-            </div>
-
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-slate-300 mb-2">
-                  Load Reference Signatures
-                </label>
-                <div className="border-2 border-dashed border-slate-600 rounded-lg p-6 text-center hover:border-cyan-400 transition-colors">
-                  <input
-                    type="file"
-                    multiple
-                    accept="image/*"
-                    onChange={handleReferenceFileChange}
-                    className="hidden"
-                    id="reference-upload"
-                    disabled={!modelStatus.trained}
-                  />
-                  <label htmlFor="reference-upload" className={`cursor-pointer ${!modelStatus.trained ? 'cursor-not-allowed opacity-50' : ''}`}>
-                    <Upload className="mx-auto h-12 w-12 text-slate-400 mb-2" />
-                    <p className="text-slate-300">Upload reference signatures</p>
-                    <p className="text-sm text-slate-500 mt-1">For comparison during verification</p>
-                  </label>
-                </div>
-              </div>
-
-              {referenceFiles.length > 0 && (
-                <div className="bg-slate-700/50 rounded-lg p-4">
-                  <p className="text-sm font-medium text-slate-300 mb-2">
-                    Reference files ({referenceFiles.length}):
-                  </p>
-                  <div className="max-h-32 overflow-y-auto space-y-1">
-                    {referenceFiles.map((file, index) => (
-                      <div key={index} className="flex items-center gap-2 text-sm text-slate-400">
-                        <FileImage className="h-4 w-4 flex-shrink-0" />
-                        <span className="truncate">{file.name}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              <button
-                onClick={loadReferenceSignatures}
-                disabled={!modelStatus.trained || referenceFiles.length === 0}
-                className="w-full bg-gradient-to-r from-cyan-600 to-blue-600 text-white py-3 px-4 rounded-lg font-medium hover:from-cyan-700 hover:to-blue-700 disabled:from-gray-600 disabled:to-gray-600 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2"
-              >
-                <Target className="h-4 w-4" />
-                Load References
-              </button>
-
-              {!modelStatus.trained && (
-                <div className="flex items-center gap-2 text-amber-300 bg-amber-900/30 border border-amber-500/30 rounded-lg p-3">
-                  <AlertTriangle className="h-4 w-4 flex-shrink-0" />
-                  <p className="text-sm">Train the AI model first</p>
-                </div>
-              )}
-
-              {referencesLoaded && (
-                <div className="bg-cyan-900/30 border border-cyan-500/30 rounded-lg p-3 flex items-center gap-2">
-                  <CheckCircle className="h-5 w-5 text-cyan-400" />
-                  <p className="text-sm text-cyan-300">References loaded successfully</p>
-                </div>
-              )}
-            </div>
-          </div>
+          {/* Reference Setup Section Removed - Simplified Workflow */}
 
           {/* Verification Section */}
           <div className="bg-slate-800/50 backdrop-blur-sm rounded-2xl border border-slate-700 p-6">
@@ -581,7 +476,7 @@ const App: React.FC = () => {
             <div className="space-y-4">
               <div>
                 <label className="block text-sm font-medium text-slate-300 mb-2">
-                  Upload Signature to Verify
+                  Upload Image for Smart AI Analysis
                 </label>
                 <div className="border-2 border-dashed border-slate-600 rounded-lg p-6 text-center hover:border-emerald-400 transition-colors">
                   <input
@@ -594,7 +489,8 @@ const App: React.FC = () => {
                   />
                   <label htmlFor="verification-upload" className={`cursor-pointer ${(isVerifying || isTraining) ? 'cursor-not-allowed opacity-50' : ''}`}>
                     <Upload className="mx-auto h-12 w-12 text-slate-400 mb-2" />
-                    <p className="text-slate-300">Upload signature for AI verification</p>
+                    <p className="text-slate-300">Upload any image for AI analysis</p>
+                    <p className="text-sm text-slate-500 mt-1">AI will detect if it's a signature and verify accordingly</p>
                   </label>
                 </div>
               </div>
@@ -609,82 +505,152 @@ const App: React.FC = () => {
 
               <button
                 onClick={verifySignature}
-                disabled={isVerifying || !verificationFile || !modelStatus.trained || isTraining}
+                disabled={isVerifying || !verificationFile || isTraining}
                 className="w-full bg-gradient-to-r from-emerald-600 to-green-600 text-white py-3 px-4 rounded-lg font-medium hover:from-emerald-700 hover:to-green-700 disabled:from-gray-600 disabled:to-gray-600 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2"
               >
                 {isVerifying ? (
                   <>
                     <Loader className="h-4 w-4 animate-spin" />
-                    AI Analyzing...
+                    AI Analyzing Image...
                   </>
                 ) : (
                   <>
                     <Zap className="h-4 w-4" />
-                    Verify with AI
+                    Analyze with AI
                   </>
                 )}
               </button>
 
-              {/* Verification Results */}
+              {!modelStatus.trained && verificationFile && (
+                <div className="bg-amber-900/30 border border-amber-500/30 rounded-lg p-3 flex items-center gap-2">
+                  <AlertTriangle className="h-4 w-4 flex-shrink-0 text-amber-400" />
+                  <div className="text-sm">
+                    <p className="text-amber-300 font-medium">Model not trained yet</p>
+                    <p className="text-amber-200">AI will detect if this is a signature, but can't verify authenticity until trained</p>
+                  </div>
+                </div>
+              )}
+
+              {/* Smart AI Analysis Results */}
               {verificationResult && (
                 <div className={`rounded-lg p-4 border ${
-                  verificationResult.verified 
-                    ? 'bg-emerald-900/30 border-emerald-500/30' 
-                    : 'bg-red-900/30 border-red-500/30'
+                  verificationResult.is_signature === false
+                    ? 'bg-orange-900/30 border-orange-500/30'
+                    : verificationResult.verified 
+                      ? 'bg-emerald-900/30 border-emerald-500/30' 
+                      : 'bg-red-900/30 border-red-500/30'
                 }`}>
                   <div className="flex items-center gap-3 mb-4">
-                    {verificationResult.verified ? (
+                    {verificationResult.is_signature === false ? (
+                      <AlertTriangle className="h-6 w-6 text-orange-400" />
+                    ) : verificationResult.verified ? (
                       <CheckCircle className="h-6 w-6 text-emerald-400" />
                     ) : (
                       <XCircle className="h-6 w-6 text-red-400" />
                     )}
                     <span className={`font-bold text-lg ${
-                      verificationResult.verified ? 'text-emerald-300' : 'text-red-300'
+                      verificationResult.is_signature === false 
+                        ? 'text-orange-300'
+                        : verificationResult.verified ? 'text-emerald-300' : 'text-red-300'
                     }`}>
-                      {verificationResult.verified ? 'VERIFIED ✓' : 'REJECTED ✗'}
+                      {verificationResult.is_signature === false 
+                        ? 'NOT A SIGNATURE' 
+                        : verificationResult.verified ? 'VERIFIED ✓' : 'REJECTED ✗'}
                     </span>
                   </div>
                   
                   <div className="space-y-3">
-                    <div className="flex justify-between items-center">
-                      <span className="text-sm font-medium text-slate-300">AI Confidence:</span>
-                      <span className={`font-bold text-lg ${
-                        verificationResult.verified ? 'text-emerald-400' : 'text-red-400'
-                      }`}>
-                        {(verificationResult.confidence * 100).toFixed(1)}%
-                      </span>
-                    </div>
+                    {/* Signature Detection Confidence */}
+                    {verificationResult.signature_confidence !== undefined && (
+                      <div className="flex justify-between items-center">
+                        <span className="text-sm font-medium text-slate-300">Signature Detection:</span>
+                        <span className={`font-bold ${
+                          verificationResult.is_signature ? 'text-emerald-400' : 'text-orange-400'
+                        }`}>
+                          {(verificationResult.signature_confidence * 100).toFixed(1)}%
+                        </span>
+                      </div>
+                    )}
                     
+                    {/* Verification Confidence (only for actual signatures) */}
+                    {verificationResult.verification_confidence !== undefined && verificationResult.is_signature && (
+                      <div className="flex justify-between items-center">
+                        <span className="text-sm font-medium text-slate-300">Verification Confidence:</span>
+                        <span className={`font-bold ${
+                          verificationResult.verified ? 'text-emerald-400' : 'text-red-400'
+                        }`}>
+                          {(verificationResult.verification_confidence * 100).toFixed(1)}%
+                        </span>
+                      </div>
+                    )}
+                    
+                    {/* Progress bar for main confidence */}
                     <div className="w-full bg-slate-700 rounded-full h-3">
                       <div 
                         className={`h-3 rounded-full transition-all duration-1000 ${
-                          verificationResult.verified 
-                            ? 'bg-gradient-to-r from-emerald-500 to-green-400' 
-                            : 'bg-gradient-to-r from-red-500 to-orange-400'
+                          verificationResult.is_signature === false
+                            ? 'bg-gradient-to-r from-orange-500 to-yellow-400'
+                            : verificationResult.verified 
+                              ? 'bg-gradient-to-r from-emerald-500 to-green-400' 
+                              : 'bg-gradient-to-r from-red-500 to-orange-400'
                         }`}
-                        style={{ width: `${verificationResult.confidence * 100}%` }}
+                        style={{ 
+                          width: `${(verificationResult.verification_confidence || verificationResult.signature_confidence || 0) * 100}%` 
+                        }}
                       />
                     </div>
                     
+                    {/* Method and threshold info */}
                     {verificationResult.method && (
                       <div className="flex justify-between items-center text-xs text-slate-400">
-                        <span>Method:</span>
+                        <span>Analysis Method:</span>
                         <span className="capitalize">{verificationResult.method.replace('_', ' ')}</span>
                       </div>
                     )}
                     
                     {verificationResult.threshold_used && (
                       <div className="flex justify-between items-center text-xs text-slate-400">
-                        <span>Threshold:</span>
+                        <span>AI Threshold:</span>
                         <span>{(verificationResult.threshold_used * 100).toFixed(1)}%</span>
                       </div>
                     )}
                     
-                    <p className={`text-sm mt-3 ${
-                      verificationResult.verified ? 'text-emerald-300' : 'text-red-300'
+                    {/* Main message */}
+                    <p className={`text-sm mt-3 font-medium ${
+                      verificationResult.is_signature === false
+                        ? 'text-orange-300'
+                        : verificationResult.verified ? 'text-emerald-300' : 'text-red-300'
                     }`}>
                       {verificationResult.message}
                     </p>
+                    
+                    {/* Suggestion for non-signatures */}
+                    {verificationResult.suggestion && (
+                      <p className="text-xs text-slate-400 mt-2 italic">
+                        💡 {verificationResult.suggestion}
+                      </p>
+                    )}
+                    
+                    {/* Additional details for signatures */}
+                    {verificationResult.details && verificationResult.is_signature && (
+                      <div className="mt-3 p-3 bg-slate-700/50 rounded-lg">
+                        <p className="text-xs font-medium text-slate-300 mb-2">AI Analysis Details:</p>
+                        <div className="grid grid-cols-1 gap-1 text-xs text-slate-400">
+                          {verificationResult.details.feature_magnitude && (
+                            <div className="flex justify-between">
+                              <span>Feature Strength:</span>
+                              <span>{verificationResult.details.feature_magnitude.toFixed(2)}</span>
+                            </div>
+                          )}
+                          {verificationResult.details.feature_diversity && (
+                            <div className="flex justify-between">
+                              <span>Pattern Diversity:</span>
+                              <span>{verificationResult.details.feature_diversity.toFixed(2)}</span>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
               )}
@@ -702,10 +668,10 @@ const App: React.FC = () => {
         {/* Footer */}
         <div className="mt-12 text-center text-slate-400">
           <p className="text-sm mb-2">
-            Advanced AI-Powered Signature Verification System
+            Intelligent AI-Powered Image Analysis & Signature Verification
           </p>
           <p className="text-xs">
-            ResNet50 Feature Extraction • Siamese Neural Network • Synthetic Forgery Generation • Advanced Preprocessing
+            Smart Signature Detection • Image Classification • MobileNetV2 Feature Extraction • Siamese Neural Network • Advanced Computer Vision
           </p>
           {modelStatus.verification_threshold && (
             <p className="text-xs mt-1 text-slate-500">
