@@ -580,10 +580,13 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
             ]
 
             # Clear any existing models from memory
-            if 'signature_model' in globals() and signature_model is not None:
+            global signature_model, feature_extractor
+            if signature_model is not None:
                 del signature_model
-            if 'feature_extractor' in globals() and feature_extractor is not None:
+                signature_model = None
+            if feature_extractor is not None:
                 del feature_extractor
+                feature_extractor = None
             tf.keras.backend.clear_session()
 
             # Use fit with generators for memory efficiency
