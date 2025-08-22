@@ -455,6 +455,7 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
         file_contents.append(contents)
 
     async def training_process():
+        global signature_model, feature_extractor, model_trained, num_signatures, verification_threshold, training_metadata
         try:
             start_time = time.time()
             logger.info(f"Starting advanced AI training with {len(training_images)} genuine signatures")
@@ -470,7 +471,7 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
                 processed_sig = preprocessor.preprocess_signature(contents)
                 genuine_signatures.append(processed_sig)
                 
-                yield f'data: {json.dumps({"progress": f"Processed genuine signature {i+1}/{len(training_images)}"})}\n\n'
+                yield f'data: {json.dumps({"progress": f"Processed genuine signature {i+1}/{len(file_contents)}"})}\n\n'
                 await asyncio.sleep(0.1)
 
             yield f'data: {json.dumps({"progress": "Generating training variations..."})}\n\n'
@@ -626,7 +627,6 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
             ]
 
             # Clear any existing models from memory
-            global signature_model, feature_extractor
             if signature_model is not None:
                 del signature_model
                 signature_model = None
@@ -681,7 +681,7 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
                 pickle.dump(verification_threshold, f)
             
             training_metadata = {
-                'num_genuine_samples': len(training_images),
+                'num_genuine_samples': len(file_contents),
                 'total_training_pairs': len(training_pairs),
                 'validation_accuracy': accuracy,
                 'precision': precision,
@@ -698,7 +698,7 @@ async def train_signature_model(training_images: List[UploadFile] = File(...)):
             signature_model = siamese_model
             feature_extractor = feature_net
             model_trained = True
-            num_signatures = len(training_images)
+            num_signatures = len(file_contents)
 
             logger.info(f"Training completed successfully!")
             logger.info(f"Validation Accuracy: {accuracy:.2f}%")
