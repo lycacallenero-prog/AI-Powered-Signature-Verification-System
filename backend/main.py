@@ -66,6 +66,64 @@ TRAINING_METADATA_PATH = MODEL_DIR / "training_metadata.pkl"
 THRESHOLD_PATH = MODEL_DIR / "verification_threshold.pkl"
 
 # -----------------------------
+# Custom Layers for Serialization
+# -----------------------------
+class L2NormalizeLayer(layers.Layer):
+    """Custom L2 normalization layer that can be serialized"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+    
+    def call(self, inputs):
+        return tf.nn.l2_normalize(inputs, axis=1)
+    
+    def get_config(self):
+        return super().get_config()
+
+class L2DistanceLayer(layers.Layer):
+    """Custom L2 distance layer that can be serialized"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+    
+    def call(self, inputs):
+        return tf.sqrt(tf.reduce_sum(tf.square(inputs[0] - inputs[1]), axis=1, keepdims=True))
+    
+    def get_config(self):
+        return super().get_config()
+
+class CosineSimilarityLayer(layers.Layer):
+    """Custom cosine similarity layer that can be serialized"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+    
+    def call(self, inputs):
+        return tf.reduce_sum(inputs[0] * inputs[1], axis=1, keepdims=True)
+    
+    def get_config(self):
+        return super().get_config()
+
+class AbsDifferenceLayer(layers.Layer):
+    """Custom absolute difference layer that can be serialized"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+    
+    def call(self, inputs):
+        return tf.abs(inputs[0] - inputs[1])
+    
+    def get_config(self):
+        return super().get_config()
+
+class ElementMultiplyLayer(layers.Layer):
+    """Custom element-wise multiplication layer that can be serialized"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+    
+    def call(self, inputs):
+        return inputs[0] * inputs[1]
+    
+    def get_config(self):
+        return super().get_config()
+
+# -----------------------------
 # Data Generator for Memory Efficiency
 # -----------------------------
 class SignatureDataGenerator(keras.utils.Sequence):
@@ -281,10 +339,7 @@ class SignatureVerificationModel:
         features = layers.Dense(64, activation='relu', name='signature_features')(x)  # Reduced from 128
         
         # L2 normalization for stable similarity computation
-        normalized_features = layers.Lambda(
-            lambda x: tf.nn.l2_normalize(x, axis=1), 
-            name='l2_normalize'
-        )(features)
+        normalized_features = L2NormalizeLayer(name='l2_normalize')(features)
         
         model = keras.Model(inputs, normalized_features, name='signature_feature_extractor')
         return model
@@ -302,30 +357,18 @@ class SignatureVerificationModel:
         features_genuine = feature_extractor(input_genuine)
         features_test = feature_extractor(input_test)
         
-        # Compute multiple similarity measures
+        # Compute multiple similarity measures using custom layers
         # 1. L2 distance
-        l2_distance = layers.Lambda(
-            lambda x: tf.sqrt(tf.reduce_sum(tf.square(x[0] - x[1]), axis=1, keepdims=True)),
-            name='l2_distance'
-        )([features_genuine, features_test])
+        l2_distance = L2DistanceLayer(name='l2_distance')([features_genuine, features_test])
         
         # 2. Cosine similarity
-        cosine_similarity = layers.Lambda(
-            lambda x: tf.reduce_sum(x[0] * x[1], axis=1, keepdims=True),
-            name='cosine_similarity'
-        )([features_genuine, features_test])
+        cosine_similarity = CosineSimilarityLayer(name='cosine_similarity')([features_genuine, features_test])
         
         # 3. Element-wise absolute difference
-        abs_diff = layers.Lambda(
-            lambda x: tf.abs(x[0] - x[1]),
-            name='abs_difference'
-        )([features_genuine, features_test])
+        abs_diff = AbsDifferenceLayer(name='abs_difference')([features_genuine, features_test])
         
         # 4. Element-wise multiplication
-        element_mult = layers.Lambda(
-            lambda x: x[0] * x[1],
-            name='element_multiplication'
-        )([features_genuine, features_test])
+        element_mult = ElementMultiplyLayer(name='element_multiplication')([features_genuine, features_test])
         
         # Combine all similarity measures
         combined_features = layers.Concatenate(name='combined_features')([
@@ -1012,26 +1055,44 @@ def load_saved_model():
         
         # Load models with custom objects
         custom_objects = {
-            'l2_normalize': lambda x: tf.nn.l2_normalize(x, axis=1)
+            'L2NormalizeLayer': L2NormalizeLayer,
+            'L2DistanceLayer': L2DistanceLayer,
+            'CosineSimilarityLayer': CosineSimilarityLayer,
+            'AbsDifferenceLayer': AbsDifferenceLayer,
+            'ElementMultiplyLayer': ElementMultiplyLayer
         }
         
         if SIGNATURE_MODEL_PATH.exists():
             logger.info("Loading signature verification model...")
-            signature_model = keras.models.load_model(
-                SIGNATURE_MODEL_PATH,
-                custom_objects=custom_objects,
-                compile=False
-            )
-            logger.info("Signature model loaded successfully")
+            try:
+                signature_model = keras.models.load_model(
+                    SIGNATURE_MODEL_PATH,
+                    custom_objects=custom_objects,
+                    compile=False
+                )
+                logger.info("Signature model loaded successfully")
+            except Exception as e:
+                logger.warning(f"Failed to load signature model (likely old format): {e}")
+                logger.info("Removing old model files - will require retraining")
+                if SIGNATURE_MODEL_PATH.exists():
+                    SIGNATURE_MODEL_PATH.unlink()
+                signature_model = None
         
         if FEATURE_EXTRACTOR_PATH.exists():
             logger.info("Loading feature extractor...")
-            feature_extractor = keras.models.load_model(
-                FEATURE_EXTRACTOR_PATH,
-                custom_objects=custom_objects,
-                compile=False
-            )
-            logger.info("Feature extractor loaded successfully")
+            try:
+                feature_extractor = keras.models.load_model(
+                    FEATURE_EXTRACTOR_PATH,
+                    custom_objects=custom_objects,
+                    compile=False
+                )
+                logger.info("Feature extractor loaded successfully")
+            except Exception as e:
+                logger.warning(f"Failed to load feature extractor (likely old format): {e}")
+                logger.info("Removing old model files - will require retraining")
+                if FEATURE_EXTRACTOR_PATH.exists():
+                    FEATURE_EXTRACTOR_PATH.unlink()
+                feature_extractor = None
         
         # Update global status
         if signature_model is not None and feature_extractor is not None:
@@ -1073,8 +1134,22 @@ async def reset_model():
     if hasattr(verify_signature, 'reference_signatures'):
         delattr(verify_signature, 'reference_signatures')
     
+    # Delete saved model files to force retraining with new format
+    try:
+        if SIGNATURE_MODEL_PATH.exists():
+            SIGNATURE_MODEL_PATH.unlink()
+        if FEATURE_EXTRACTOR_PATH.exists():
+            FEATURE_EXTRACTOR_PATH.unlink()
+        if TRAINING_METADATA_PATH.exists():
+            TRAINING_METADATA_PATH.unlink()
+        if THRESHOLD_PATH.exists():
+            THRESHOLD_PATH.unlink()
+        logger.info("Deleted old model files")
+    except Exception as e:
+        logger.warning(f"Error deleting model files: {e}")
+    
     logger.info("Model reset completed")
-    return {"message": "Model reset successfully"}
+    return {"message": "Model reset successfully - old model files deleted"}
 
 # -----------------------------
 # Startup
